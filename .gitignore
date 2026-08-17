@@ -1,0 +1,16 @@
+# Logs
+logs/
+*.log
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
+
+# PowerShell history
+*.pshistory
+
+# OneDrive temp files
+*.tmp
