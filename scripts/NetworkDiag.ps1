@@ -1,5 +1,5 @@
 # ============================
-# LightingWatchdog - Diagnostic Script (v1.1)
+# LightingWatchdog - Diagnostic Script (v1.2)
 # ============================
 
 $logFolder = "..\logs"
@@ -16,7 +16,7 @@ $logFile = "$logFolder\NetworkDiag_$timestamp.txt"
 $tcpTotal = (Get-NetTCPConnection).Count
 "1) Total TCP connections: $tcpTotal`n" | Out-File $logFile -Append
 
-# 2) LightingService leak detection
+# 2) LightingService leak detection + auto-restart (v1.2)
 $lightingProc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
 if ($lightingProc) {
     $lightingPID = $lightingProc.Id
@@ -26,9 +26,24 @@ if ($lightingProc) {
     "   LightingService PID: $lightingPID" | Out-File $logFile -Append
     "   LightingService TCP connections: $lightingConns" | Out-File $logFile -Append
 
-    if ($lightingConns -gt 1000) {
-        "   LEAK DETECTED: LightingService exceeded 1000 connections." | Out-File $logFile -Append
-    } else {
+    $leakThreshold = 1000
+
+    if ($lightingConns -gt $leakThreshold) {
+        "   LEAK DETECTED: LightingService exceeded $leakThreshold connections." | Out-File $logFile -Append
+        "   ACTION: Restarting LightingService..." | Out-File $logFile -Append
+
+        # Auto-restart logic
+        try {
+            Stop-Process -Id $lightingPID -Force -ErrorAction Stop
+            Start-Sleep -Seconds 2
+            Start-Service -Name LightingService -ErrorAction Stop
+            "   RESULT: LightingService restarted successfully." | Out-File $logFile -Append
+        }
+        catch {
+            "   ERROR: Failed to restart LightingService. $_" | Out-File $logFile -Append
+        }
+    }
+    else {
         "   Status: Normal (below leak threshold)" | Out-File $logFile -Append
     }
 } else {
