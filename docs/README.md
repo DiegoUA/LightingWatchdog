@@ -43,6 +43,8 @@ This repository contains:
 | --- | --- | --- |
 | **v1.0** | 2026‑08‑17 | Baseline diagnostic script — collects TCP/UDP stats and logs results. |
 | **v1.1** | 2026‑08‑18 | Added LightingService leak detection and logging of excessive TCP connections. |
+| **v1.2** | 2026‑08‑18 | Added automatic restart of LightingService when leak threshold is exceeded. |
+| **v1.3** | 2026‑08‑18 | Added popup notifications for leak detection and restart events. |
 ---
 
 ## 🚀 Usage

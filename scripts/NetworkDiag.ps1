@@ -1,6 +1,13 @@
 # ============================
-# LightingWatchdog - Diagnostic Script (v1.2)
+# LightingWatchdog - Diagnostic Script (v1.3)
 # ============================
+
+# Enable popup support
+Add-Type -AssemblyName System.Windows.Forms
+
+function Show-Popup($message, $title) {
+    [System.Windows.Forms.MessageBox]::Show($message, $title)
+}
 
 $logFolder = "..\logs"
 if (!(Test-Path $logFolder)) {
@@ -16,7 +23,7 @@ $logFile = "$logFolder\NetworkDiag_$timestamp.txt"
 $tcpTotal = (Get-NetTCPConnection).Count
 "1) Total TCP connections: $tcpTotal`n" | Out-File $logFile -Append
 
-# 2) LightingService leak detection + auto-restart (v1.2)
+# 2) LightingService leak detection + auto-restart + popups (v1.3)
 $lightingProc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
 if ($lightingProc) {
     $lightingPID = $lightingProc.Id
@@ -29,18 +36,25 @@ if ($lightingProc) {
     $leakThreshold = 1000
 
     if ($lightingConns -gt $leakThreshold) {
-        "   LEAK DETECTED: LightingService exceeded $leakThreshold connections." | Out-File $logFile -Append
+        $msg = "LightingService leak detected! Connections: $lightingConns"
+        Show-Popup $msg "LightingWatchdog Alert"
+        "   POPUP: $msg" | Out-File $logFile -Append
+
         "   ACTION: Restarting LightingService..." | Out-File $logFile -Append
 
-        # Auto-restart logic
         try {
             Stop-Process -Id $lightingPID -Force -ErrorAction Stop
             Start-Sleep -Seconds 2
             Start-Service -Name LightingService -ErrorAction Stop
-            "   RESULT: LightingService restarted successfully." | Out-File $logFile -Append
+
+            $msg2 = "LightingService restarted successfully."
+            Show-Popup $msg2 "LightingWatchdog Action"
+            "   RESULT: $msg2" | Out-File $logFile -Append
         }
         catch {
-            "   ERROR: Failed to restart LightingService. $_" | Out-File $logFile -Append
+            $msg3 = "Failed to restart LightingService: $_"
+            Show-Popup $msg3 "LightingWatchdog Error"
+            "   ERROR: $msg3" | Out-File $logFile -Append
         }
     }
     else {
