@@ -46,6 +46,7 @@ This repository contains:
 | **v1.2** | 2026‑08‑18 | Added automatic restart of LightingService when leak threshold is exceeded. |
 | **v1.3** | 2026‑08‑18 | Added popup notifications for leak detection and restart events. |
 | **v1.4** | 2026‑08‑18 | Added nonpaged pool monitoring and kernel memory pressure alerts. |
+| **v1.5** | 2026‑08‑18 | Added WebSocket storm detection and connection churn monitoring. |
 ---
 
 ## 🚀 Usage

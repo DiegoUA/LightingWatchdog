@@ -1,5 +1,5 @@
 # ============================
-# LightingWatchdog - Diagnostic Script (v1.4)
+# LightingWatchdog - Diagnostic Script (v1.5)
 # ============================
 
 # Enable popup support
@@ -90,8 +90,40 @@ if ($nonPagedPercent -gt $nonPagedThreshold) {
 
 "`n" | Out-File $logFile -Append
 
-# 4) Top processes by TCP connections
-"4) Top processes by TCP connections:" | Out-File $logFile -Append
+# 4) WebSocket storm detection (v1.5)
+"4) WebSocket storm detection:" | Out-File $logFile -Append
+
+# Capture initial snapshot
+$initialTCP = (Get-NetTCPConnection).Count
+$initialUDP = (Get-NetUDPEndpoint).Count
+
+Start-Sleep -Seconds 1
+
+# Capture second snapshot
+$finalTCP = (Get-NetTCPConnection).Count
+$finalUDP = (Get-NetUDPEndpoint).Count
+
+# Calculate churn
+$tcpNew = $finalTCP - $initialTCP
+$udpNew = $finalUDP - $initialUDP
+
+"   New TCP connections/sec: $tcpNew" | Out-File $logFile -Append
+"   New UDP endpoints/sec: $udpNew" | Out-File $logFile -Append
+
+$stormThreshold = 200
+
+if ($tcpNew -gt $stormThreshold -or $udpNew -gt $stormThreshold) {
+    $msgStorm = "WebSocket storm detected! TCP/sec: $tcpNew, UDP/sec: $udpNew"
+    Show-Popup $msgStorm "LightingWatchdog Storm Alert"
+    "   ALERT: $msgStorm" | Out-File $logFile -Append
+} else {
+    "   Status: Normal (no storm detected)" | Out-File $logFile -Append
+}
+
+"`n" | Out-File $logFile -Append
+
+# 5) Top processes by TCP connections
+"5) Top processes by TCP connections:" | Out-File $logFile -Append
 $topTCP = Get-NetTCPConnection |
     Group-Object -Property OwningProcess |
     Sort-Object Count -Descending |
@@ -103,16 +135,16 @@ foreach ($item in $topTCP) {
 }
 "`n" | Out-File $logFile -Append
 
-# 5) TIME_WAIT count
+# 6) TIME_WAIT count
 $timeWait = netstat -an | Select-String "TIME_WAIT" | Measure-Object
-"5) TIME_WAIT sockets: $($timeWait.Count)`n" | Out-File $logFile -Append
+"6) TIME_WAIT sockets: $($timeWait.Count)`n" | Out-File $logFile -Append
 
-# 6) Total UDP endpoints
+# 7) Total UDP endpoints
 $udpTotal = (Get-NetUDPEndpoint).Count
-"6) Total UDP endpoints: $udpTotal`n" | Out-File $logFile -Append
+"7) Total UDP endpoints: $udpTotal`n" | Out-File $logFile -Append
 
-# 7) Top processes by UDP usage
-"7) Top processes by UDP usage:" | Out-File $logFile -Append
+# 8) Top processes by UDP usage
+"8) Top processes by UDP usage:" | Out-File $logFile -Append
 $topUDP = Get-NetUDPEndpoint |
     Group-Object -Property OwningProcess |
     Sort-Object Count -Descending |
