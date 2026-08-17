@@ -47,6 +47,7 @@ This repository contains:
 | **v1.3** | 2026‑08‑18 | Added popup notifications for leak detection and restart events. |
 | **v1.4** | 2026‑08‑18 | Added nonpaged pool monitoring and kernel memory pressure alerts. |
 | **v1.5** | 2026‑08‑18 | Added WebSocket storm detection and connection churn monitoring. |
+| **v1.6** | 2026‑08‑18 | Added continuous watchdog loop, periodic diagnostics, and basic log rotation. |
 ---
 
 ## 🚀 Usage
@@ -55,6 +56,11 @@ Run the baseline diagnostic script:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1
+```
+Run continuous watchdog mode (v1.6):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1 -Watchdog
 ```
 Logs will appear in the logs/ folder.
 ---
