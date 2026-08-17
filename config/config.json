@@ -1,0 +1,10 @@
+{
+    "LeakThreshold": 1000,
+    "NonPagedPoolThreshold": 70,
+    "StormThreshold": 200,
+    "WatchdogIntervalSeconds": 60,
+    "MaxLogFiles": 20,
+    "EnablePopups": true,
+    "EnableJsonExport": true,
+    "EnableCsvExport": true
+}
