@@ -38,6 +38,13 @@ This repository contains:
 
 ---
 
+## 🧩 Version History
+| Version | Date | Description |
+| --- | --- | --- |
+| **v1.0** | 2026‑08‑17 | Baseline diagnostic script — collects TCP/UDP stats and logs results. |
+| **v1.1** | 2026‑08‑18 | Added LightingService leak detection and logging of excessive TCP connections. |
+---
+
 ## 🚀 Usage
 
 Run the baseline diagnostic script:
@@ -45,6 +52,7 @@ Run the baseline diagnostic script:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1
 ```
+Logs will appear in the logs/ folder.
 ---
 
 ## 🧾 License
