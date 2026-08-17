@@ -9,7 +9,14 @@ Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingS
 LightingWatchdog/
 │
 ├── scripts/
-│   └── NetworkDiag.ps1
+│   ├── NetworkDiag.ps1
+│   ├── Modules/
+│   │   ├── Diagnostics.psm1
+│   │   ├── Watchdog.psm1
+│   │   └── Utils.psm1
+│
+├── config/
+│   └── config.json
 │
 ├── logs/
 │   └── .gitkeep
@@ -20,34 +27,38 @@ LightingWatchdog/
 ├── .gitignore
 └── LICENSE
 ```
+
 ## ⚙️ Description
 
-LightingWatchdog is a Windows diagnostic tool designed to detect and analyze
-network buffer exhaustion, TCP/UDP socket leaks, and specifically the known
-LightingService leak affecting ASUS systems.
+LightingWatchdog is a modular Windows diagnostic and watchdog system designed to detect and mitigate:
 
-This repository contains:
+- TCP/UDP socket leaks
 
-- Baseline diagnostic script (v1.0)
-- Future versions will include:
-  - Leak detection
-  - Auto-restart logic
-  - WebSocket storm detection
-  - Nonpaged pool monitoring
-  - Full watchdog automation
+- LightingService runaway connection storms
+
+- Nonpaged pool exhaustion
+
+- WebSocket storms
+
+- Kernel memory pressure
+
+From v2.0, the project becomes modular, configurable, and ready for long‑term expansion.
 
 ---
 
 ## 🧩 Version History
+
 | Version | Date | Description |
 | --- | --- | --- |
-| **v1.0** | 2026‑08‑17 | Baseline diagnostic script — collects TCP/UDP stats and logs results. |
-| **v1.1** | 2026‑08‑18 | Added LightingService leak detection and logging of excessive TCP connections. |
-| **v1.2** | 2026‑08‑18 | Added automatic restart of LightingService when leak threshold is exceeded. |
-| **v1.3** | 2026‑08‑18 | Added popup notifications for leak detection and restart events. |
-| **v1.4** | 2026‑08‑18 | Added nonpaged pool monitoring and kernel memory pressure alerts. |
-| **v1.5** | 2026‑08‑18 | Added WebSocket storm detection and connection churn monitoring. |
-| **v1.6** | 2026‑08‑18 | Added continuous watchdog loop, periodic diagnostics, and basic log rotation. |
+| **v1.0** | 2026‑08‑17 | Baseline diagnostic script. |
+| **v1.1** | 2026‑08‑18 | LightingService leak detection. |
+| **v1.2** | 2026‑08‑18 | Auto-restart logic. |
+| **v1.3** | 2026‑08‑18 | Popup notifications. |
+| **v1.4** | 2026‑08‑18 | Nonpaged pool monitoring. |
+| **v1.5** | 2026‑08‑18 | WebSocket storm detection. |
+| **v1.6** | 2026‑08‑18 | Continuous watchdog loop + log rotation. |
+| **v2.0** | 2026‑08‑18 | Modular architecture, config file, unified logging, service abstraction. |
+
 ---
 
 ## 🚀 Usage
@@ -63,6 +74,16 @@ Run continuous watchdog mode (v1.6):
 powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1 -Watchdog
 ```
 Logs will appear in the logs/ folder.
+---
+
+## ⚙️ Configuration
+
+Edit thresholds in:
+
+```json
+config/config.json
+```
+
 ---
 
 ## 🧾 License
