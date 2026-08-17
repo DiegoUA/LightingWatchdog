@@ -1,5 +1,5 @@
 # ============================
-# LightingWatchdog - Diagnostic Script (v1.3)
+# LightingWatchdog - Diagnostic Script (v1.4)
 # ============================
 
 # Enable popup support
@@ -66,8 +66,32 @@ if ($lightingProc) {
 
 "`n" | Out-File $logFile -Append
 
-# 3) Top processes by TCP connections
-"3) Top processes by TCP connections:" | Out-File $logFile -Append
+# 3) Nonpaged pool monitoring (v1.4)
+"3) Nonpaged pool usage:" | Out-File $logFile -Append
+
+$osInfo = Get-CimInstance Win32_OperatingSystem
+$nonPagedPool = $osInfo.NonPagedPoolSize
+$nonPagedPoolMax = $osInfo.NonPagedPoolQuota
+$nonPagedPercent = [math]::Round(($nonPagedPool / $nonPagedPoolMax) * 100, 2)
+
+"   Current nonpaged pool: $nonPagedPool KB" | Out-File $logFile -Append
+"   Maximum nonpaged pool: $nonPagedPoolMax KB" | Out-File $logFile -Append
+"   Usage percent: $nonPagedPercent%" | Out-File $logFile -Append
+
+$nonPagedThreshold = 70
+
+if ($nonPagedPercent -gt $nonPagedThreshold) {
+    $msgNP = "Warning: Nonpaged pool usage is high ($nonPagedPercent%). Kernel memory pressure detected."
+    Show-Popup $msgNP "LightingWatchdog Kernel Alert"
+    "   ALERT: $msgNP" | Out-File $logFile -Append
+} else {
+    "   Status: Normal (below kernel memory threshold)" | Out-File $logFile -Append
+}
+
+"`n" | Out-File $logFile -Append
+
+# 4) Top processes by TCP connections
+"4) Top processes by TCP connections:" | Out-File $logFile -Append
 $topTCP = Get-NetTCPConnection |
     Group-Object -Property OwningProcess |
     Sort-Object Count -Descending |
@@ -79,16 +103,16 @@ foreach ($item in $topTCP) {
 }
 "`n" | Out-File $logFile -Append
 
-# 4) TIME_WAIT count
+# 5) TIME_WAIT count
 $timeWait = netstat -an | Select-String "TIME_WAIT" | Measure-Object
-"4) TIME_WAIT sockets: $($timeWait.Count)`n" | Out-File $logFile -Append
+"5) TIME_WAIT sockets: $($timeWait.Count)`n" | Out-File $logFile -Append
 
-# 5) Total UDP endpoints
+# 6) Total UDP endpoints
 $udpTotal = (Get-NetUDPEndpoint).Count
-"5) Total UDP endpoints: $udpTotal`n" | Out-File $logFile -Append
+"6) Total UDP endpoints: $udpTotal`n" | Out-File $logFile -Append
 
-# 6) Top processes by UDP usage
-"6) Top processes by UDP usage:" | Out-File $logFile -Append
+# 7) Top processes by UDP usage
+"7) Top processes by UDP usage:" | Out-File $logFile -Append
 $topUDP = Get-NetUDPEndpoint |
     Group-Object -Property OwningProcess |
     Sort-Object Count -Descending |
