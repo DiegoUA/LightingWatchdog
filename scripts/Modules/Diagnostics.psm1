@@ -54,13 +54,17 @@ function Get-LeakGrowthRate {
     $first = $data[0]
     $last  = $data[$data.Count - 1]
 
+    try {
+        $firstTime = [datetime]::ParseExact($first.Timestamp, "yyyy-MM-dd_HH-mm-ss", $null)
+        $lastTime  = [datetime]::ParseExact($last.Timestamp, "yyyy-MM-dd_HH-mm-ss", $null)
+    } catch {
+        return 0
+    }
+
     $firstConns = [double]$first.LightingServiceConns
     $lastConns  = [double]$last.LightingServiceConns
 
-    $firstTime = [datetime]::Parse($first.Timestamp)
-    $lastTime  = [datetime]::Parse($last.Timestamp)
-
-    $deltaConns = $lastConns - $firstConns
+    $deltaConns   = $lastConns - $firstConns
     $deltaSeconds = ($lastTime - $firstTime).TotalSeconds
 
     if ($deltaSeconds -le 0) {
@@ -200,7 +204,7 @@ function Invoke-Diagnostics {
     $result.LeakGrowthRate = Get-LeakGrowthRate -DiagnosticsCsvPath $diagnosticsCsvPath -Window $Config.TrendWindow
     Write-Log $logFile "Leak growth rate: $($result.LeakGrowthRate) connections/sec"
 
-    # 8) Nonpaged trend (simple)
+    # 8) Nonpaged trend
     if ($trendData -ne $null -and $trendData.Count -ge 3) {
         $npValues = $trendData.NonPagedPercent | ForEach-Object { [double]$_ }
         $npAvg = ($npValues | Measure-Object -Average).Average
