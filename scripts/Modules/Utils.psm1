@@ -1,6 +1,7 @@
 function Get-Config {
-    $path = "..\\config\\config.json"
-    return Get-Content $path | ConvertFrom-Json
+    # config folder is two levels above Modules\
+    $configPath = Join-Path $PSScriptRoot "..\..\config\config.json"
+    return Get-Content $configPath | ConvertFrom-Json
 }
 
 function Get-Timestamp {
@@ -12,7 +13,7 @@ function Get-Timestamp {
     $now = if ($UseUtc) { (Get-Date).ToUniversalTime() } else { Get-Date }
 
     switch ($TimestampFormat) {
-        "ISO8601" { return $now.ToString("yyyy-MM-ddTHH-mm-ssZ") }  # filesystem-safe
+        "ISO8601" { return $now.ToString("yyyy-MM-ddTHH-mm-ssZ") }
         default   { return $now.ToString("yyyy-MM-dd_HH-mm-ss") }
     }
 }

@@ -75,17 +75,25 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 | **v2.4** | 2026‑08‑19 | Restart tracking, leak growth rate, kernel trend, cooldown, webhook notifications. |
 | **v2.4.1** | 2026‑08‑19 | Fixed timestamp parsing using ParseExact; stabilized leak growth rate; added full restart logic, cooldown, webhook support. |
 | **v2.5** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
+| **v2.5.1** | 2026‑08‑19 | Filesystem-safe timestamps, PS 5.1 stddev fix, ensured logs folder creation. |
+| **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, ``$PSScriptRoot`` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
 
-## Key v2.5 Features
+## Key Features
 
-- ISO‑8601 timestamps (`yyyy-MM-ddTHH:mm:ssZ`)
+- Leak detection and restart with cooldown
+- Kernel nonpaged pool monitoring
+- WebSocket storm detection
+- Health scoring and trend analysis
+- Leak growth rate
+- Nonpaged trend
+- ISO-like timestamps (filesystem-safe)
 - Optional UTC mode
 - Watchdog heartbeat (`logs/heartbeat.json`)
 - Clock drift detection
 - Quarantine mode for LightingService
-- Auto‑kill for runaway processes
-- Watchdog health score
-- Existing leak, trend, health scoring, restart logic, webhooks, JSON/CSV exports.
+- Auto-kill for runaway processes
+- JSON + CSV exports
+- Optional webhook notifications
 
 ---
 

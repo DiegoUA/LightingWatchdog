@@ -8,8 +8,7 @@ function Get-TrendData {
         return $null
     }
 
-    $data = Import-Csv $CsvPath | Select-Object -Last $Window
-    return $data
+    return Import-Csv $CsvPath | Select-Object -Last $Window
 }
 
 function Measure-Trend {
@@ -29,7 +28,7 @@ function Measure-Trend {
 
     $scores = $TrendData.HealthScore | ForEach-Object { [double]$_ }
 
-    # Manual stddev for PS 5.1
+    # Manual StdDev for PS 5.1
     $avg = ($scores | Measure-Object -Average).Average
     $variance = ($scores | ForEach-Object { ($_ - $avg) * ($_ - $avg) } |
                  Measure-Object -Sum).Sum / $scores.Count

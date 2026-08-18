@@ -1,5 +1,5 @@
-Import-Module "..\\scripts\\Modules\\Utils.psm1"
-Import-Module "..\\scripts\\Modules\\Diagnostics.psm1"
+Import-Module "$PSScriptRoot\Utils.psm1"
+Import-Module "$PSScriptRoot\Diagnostics.psm1"
 
 $global:LastRestartTimestamp = $null
 $global:RestartHistory = @()
@@ -11,12 +11,12 @@ function Write-RestartEvent {
         $Config
     )
 
-    $exportFolder = "..\\logs\\export"
+    $exportFolder = Join-Path $PSScriptRoot "..\..\logs\export"
     if (!(Test-Path $exportFolder)) {
         New-Item -ItemType Directory -Path $exportFolder | Out-Null
     }
 
-    $restartCsvPath = "$exportFolder\\RestartEvents.csv"
+    $restartCsvPath = Join-Path $exportFolder "RestartEvents.csv"
 
     $row = New-Object PSObject -Property @{
         Timestamp            = $Result.Timestamp
@@ -59,18 +59,18 @@ function Update-Heartbeat {
         [int]$CycleTimeSeconds
     )
 
-    $logFolder = "..\\logs"
+    $logFolder = Join-Path $PSScriptRoot "..\..\logs"
     if (!(Test-Path $logFolder)) {
         New-Item -ItemType Directory -Path $logFolder | Out-Null
     }
 
-    $heartbeatPath = "$logFolder\\heartbeat.json"
+    $heartbeatPath = Join-Path $logFolder "heartbeat.json"
 
     $obj = @{
-        LastHeartbeat     = $LastHeartbeat.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
-        LastRestart       = $LastRestart.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
-        WatchdogHealth    = $WatchdogHealth
-        CycleTimeSeconds  = $CycleTimeSeconds
+        LastHeartbeat    = $LastHeartbeat.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
+        LastRestart      = $LastRestart.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
+        WatchdogHealth   = $WatchdogHealth
+        CycleTimeSeconds = $CycleTimeSeconds
     }
 
     $obj | ConvertTo-Json -Depth 4 | Out-File $heartbeatPath -Encoding UTF8
@@ -130,9 +130,9 @@ function Start-Watchdog {
 
     Show-Alert "LightingWatchdog started in continuous mode." "Watchdog" $Config.EnablePopups
 
-    $lastHeartbeat   = Get-Date
-    $lastRestart     = Get-Date
-    $watchdogHealth  = 100
+    $lastHeartbeat  = Get-Date
+    $lastRestart    = Get-Date
+    $watchdogHealth = 100
 
     while ($true) {
 
@@ -142,8 +142,8 @@ function Start-Watchdog {
 
         Apply-AutoKill -Config $Config -LogFile $logFile
 
-        $exportFolder = "..\\logs\\export"
-        $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" |
+        $exportFolder = Join-Path $PSScriptRoot "..\..\logs\export"
+        $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" -ErrorAction SilentlyContinue |
                       Sort-Object Name -Descending | Select-Object -First 1
 
         if ($latestJson) {

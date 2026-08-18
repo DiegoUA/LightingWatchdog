@@ -1,100 +1,60 @@
-Import-Module "..\\scripts\\Modules\\Utils.psm1"
-Import-Module "..\\scripts\\Modules\\Trends.psm1"
+Import-Module "$PSScriptRoot\Utils.psm1"
+Import-Module "$PSScriptRoot\Trends.psm1"
 
 function Measure-HealthScore {
-    param(
-        $Result,
-        $Config
-    )
+    param($Result, $Config)
 
     $score = 100
     $w = $Config.Weights
 
-    if ($Result.LightingLeakDetected) {
-        $score -= $w.LightingLeak
-    }
+    if ($Result.LightingLeakDetected) { $score -= $w.LightingLeak }
+    if ($Result.NonPagedPressure)     { $score -= $w.NonPagedPressure }
+    if ($Result.StormDetected)        { $score -= $w.Storm }
+    if ($Result.TcpTotal -gt $Config.LeakThreshold) { $score -= $w.TcpLoad }
+    if ($Result.UdpNewPerSec -gt $Config.StormThreshold) { $score -= $w.UdpLoad }
 
-    if ($Result.NonPagedPressure) {
-        $score -= $w.NonPagedPressure
-    }
-
-    if ($Result.StormDetected) {
-        $score -= $w.Storm
-    }
-
-    if ($Result.TcpTotal -gt $Config.LeakThreshold) {
-        $score -= $w.TcpLoad
-    }
-
-    if ($Result.UdpNewPerSec -gt $Config.StormThreshold) {
-        $score -= $w.UdpLoad
-    }
-
-    if ($score -lt 0) { $score = 0 }
-    if ($score -gt 100) { $score = 100 }
-
-    return $score
+    return [math]::Min(100, [math]::Max(0, $score))
 }
 
 function Get-LeakGrowthRate {
-    param(
-        [string]$DiagnosticsCsvPath,
-        [int]$Window
-    )
+    param([string]$DiagnosticsCsvPath, [int]$Window)
 
-    if (!(Test-Path $DiagnosticsCsvPath)) {
-        return 0
-    }
+    if (!(Test-Path $DiagnosticsCsvPath)) { return 0 }
 
     $data = Import-Csv $DiagnosticsCsvPath | Select-Object -Last $Window
-    if ($data.Count -lt 2) {
-        return 0
-    }
+    if ($data.Count -lt 2) { return 0 }
 
     $first = $data[0]
-    $last  = $data[$data.Count - 1]
+    $last  = $data[-1]
 
     try {
         $firstTime = [datetime]::Parse($first.Timestamp)
         $lastTime  = [datetime]::Parse($last.Timestamp)
-    } catch {
-        return 0
-    }
+    } catch { return 0 }
 
-    $firstConns = [double]$first.LightingServiceConns
-    $lastConns  = [double]$last.LightingServiceConns
-
-    $deltaConns   = $lastConns - $firstConns
+    $deltaConns = [double]$last.LightingServiceConns - [double]$first.LightingServiceConns
     $deltaSeconds = ($lastTime - $firstTime).TotalSeconds
 
-    if ($deltaSeconds -le 0) {
-        return 0
-    }
+    if ($deltaSeconds -le 0) { return 0 }
 
     return [math]::Round($deltaConns / $deltaSeconds, 2)
 }
 
 function Invoke-Diagnostics {
-    param(
-        $Config
-    )
+    param($Config)
 
-    $timestamp    = Get-Timestamp -UseUtc $Config.UseUtc -TimestampFormat $Config.TimestampFormat
-    $logFolder    = "..\\logs"
-    $exportFolder = "..\\logs\\export"
+    $timestamp = Get-Timestamp -UseUtc $Config.UseUtc -TimestampFormat $Config.TimestampFormat
 
-    if (!(Test-Path $logFolder)) {
-        New-Item -ItemType Directory -Path $logFolder | Out-Null
-    }
+    $logFolder    = Join-Path $PSScriptRoot "..\..\logs"
+    $exportFolder = Join-Path $logFolder "export"
 
-    if (!(Test-Path $exportFolder)) {
-        New-Item -ItemType Directory -Path $exportFolder | Out-Null
-    }
+    if (!(Test-Path $logFolder))    { New-Item -ItemType Directory -Path $logFolder | Out-Null }
+    if (!(Test-Path $exportFolder)) { New-Item -ItemType Directory -Path $exportFolder | Out-Null }
 
-    $logFile = "$logFolder\\NetworkDiag_$timestamp.txt"
-
+    $logFile = Join-Path $logFolder "NetworkDiag_$timestamp.txt"
     "=== DIAGNOSTICS ($timestamp) ===`n" | Out-File $logFile
 
+    # --- result object ---
     $result = [ordered]@{
         Timestamp              = $timestamp
         TcpTotal               = $null
@@ -141,19 +101,18 @@ function Invoke-Diagnostics {
         Write-Log $logFile "LightingService not running."
     }
 
-    # 3) Nonpaged pool (safe)
+    # 3) Nonpaged pool
     $os    = Get-CimInstance Win32_OperatingSystem
     $np    = [double]$os.NonPagedPoolSize
     $npMax = [double]$os.NonPagedPoolQuota
 
     if (-not $npMax -or $npMax -le 0 -or $npMax -lt $np) {
-        Write-Log $logFile "WARNING: NonPagedPoolQuota was 0 or invalid. Using fallback value."
+        Write-Log $logFile "WARNING: NonPagedPoolQuota invalid. Using fallback."
         $npMax = [math]::Max($np, 1) * 2
     }
 
     $npPct = [math]::Round(($np / $npMax) * 100, 2)
     $result.NonPagedPercent = $npPct
-
     Write-Log $logFile "Nonpaged pool: $npPct%"
 
     if ($npPct -gt $Config.NonPagedPoolThreshold) {
@@ -171,16 +130,15 @@ function Invoke-Diagnostics {
     $tcp2 = (Get-NetTCPConnection).Count
     $udp2 = (Get-NetUDPEndpoint).Count
 
-    $tcpNew = $tcp2 - $tcp1
-    $udpNew = $udp2 - $udp1
+    $result.TcpNewPerSec = $tcp2 - $tcp1
+    $result.UdpNewPerSec = $udp2 - $udp1
 
-    $result.TcpNewPerSec = $tcpNew
-    $result.UdpNewPerSec = $udpNew
+    Write-Log $logFile "TCP/sec: $($result.TcpNewPerSec)"
+    Write-Log $logFile "UDP/sec: $($result.UdpNewPerSec)"
 
-    Write-Log $logFile "TCP/sec: $tcpNew"
-    Write-Log $logFile "UDP/sec: $udpNew"
+    if ($result.TcpNewPerSec -gt $Config.StormThreshold -or
+        $result.UdpNewPerSec -gt $Config.StormThreshold) {
 
-    if ($tcpNew -gt $Config.StormThreshold -or $udpNew -gt $Config.StormThreshold) {
         $result.StormDetected = $true
         Show-Alert "WebSocket storm detected" "Storm Alert" $Config.EnablePopups
         Write-Log $logFile "STORM DETECTED"
@@ -191,8 +149,8 @@ function Invoke-Diagnostics {
     Write-Log $logFile "Health Score: $($result.HealthScore)"
 
     # 6) Trend analysis
-    $trendCsvPath       = "$exportFolder\\HealthTrend.csv"
-    $diagnosticsCsvPath = "$exportFolder\\diagnostics.csv"
+    $trendCsvPath       = Join-Path $exportFolder "HealthTrend.csv"
+    $diagnosticsCsvPath = Join-Path $exportFolder "diagnostics.csv"
 
     $trendData = Get-TrendData -CsvPath $trendCsvPath -Window $Config.TrendWindow
     $trend     = Measure-Trend -CurrentScore $result.HealthScore -TrendData $trendData
@@ -214,13 +172,10 @@ function Invoke-Diagnostics {
         $npAvg = ($npValues | Measure-Object -Average).Average
         $npDelta = $result.NonPagedPercent - $npAvg
 
-        if ($npDelta -gt 5) {
-            $result.NonPagedTrend = "Degrading"
-        } elseif ($npDelta -lt -5) {
-            $result.NonPagedTrend = "Improving"
-        } else {
-            $result.NonPagedTrend = "Stable"
-        }
+        $result.NonPagedTrend =
+            if ($npDelta -gt 5) { "Degrading" }
+            elseif ($npDelta -lt -5) { "Improving" }
+            else { "Stable" }
     } else {
         $result.NonPagedTrend = "Unknown"
     }
@@ -230,7 +185,7 @@ function Invoke-Diagnostics {
     # 9) Predictive alerts
     if ($Config.EnablePredictiveAlerts) {
         if ([math]::Abs($trend.ZScore) -ge 2) {
-            Write-Log $logFile "ANOMALY: Health score deviates significantly from trend (Z=$($trend.ZScore))."
+            Write-Log $logFile "ANOMALY: Health score deviates significantly (Z=$($trend.ZScore))."
             Show-Alert "Health anomaly detected (Z=$($trend.ZScore)). Trend: $($trend.TrendDirection)." "LightingWatchdog Trend" $Config.EnablePopups
         }
 
@@ -241,19 +196,18 @@ function Invoke-Diagnostics {
 
     # 10) JSON export
     if ($Config.EnableJsonExport) {
-        $jsonPath = "$exportFolder\\diag_$timestamp.json"
+        $jsonPath = Join-Path $exportFolder "diag_$timestamp.json"
         $result | ConvertTo-Json -Depth 4 | Out-File $jsonPath -Encoding UTF8
     }
 
-    # 11) CSV export (diagnostics)
+    # 11) CSV export
     if ($Config.EnableCsvExport) {
-        $csvPath = $diagnosticsCsvPath
         $obj = New-Object PSObject -Property $result
 
-        if (!(Test-Path $csvPath)) {
-            $obj | Export-Csv -Path $csvPath -NoTypeInformation
+        if (!(Test-Path $diagnosticsCsvPath)) {
+            $obj | Export-Csv -Path $diagnosticsCsvPath -NoTypeInformation
         } else {
-            $obj | Export-Csv -Path $csvPath -NoTypeInformation -Append
+            $obj | Export-Csv -Path $diagnosticsCsvPath -NoTypeInformation -Append
         }
     }
 
