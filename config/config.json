@@ -6,5 +6,15 @@
     "MaxLogFiles": 20,
     "EnablePopups": true,
     "EnableJsonExport": true,
-    "EnableCsvExport": true
+    "EnableCsvExport": true,
+    "TrendWindow": 20,
+    "EnablePredictiveAlerts": true,
+
+    "Weights": {
+        "LightingLeak": 40,
+        "NonPagedPressure": 25,
+        "Storm": 20,
+        "TcpLoad": 10,
+        "UdpLoad": 5
+    }
 }

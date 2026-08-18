@@ -1,19 +1,26 @@
-function Load-Config {
+function Get-Config {
     $path = "..\\config\\config.json"
     return Get-Content $path | ConvertFrom-Json
 }
 
-function Log {
-    param($File, $Message)
+function Write-Log {
+    param(
+        [string]$File,
+        [string]$Message
+    )
     $Message | Out-File $File -Append
 }
 
-function Popup {
-    param($Message, $Title, $EnablePopups)
+function Show-Alert {
+    param(
+        [string]$Message,
+        [string]$Title,
+        [bool]$EnablePopups
+    )
     if ($EnablePopups) {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($Message, $Title)
     }
 }
 
-Export-ModuleMember -Function Load-Config, Log, Popup
+Export-ModuleMember -Function Get-Config, Write-Log, Show-Alert
