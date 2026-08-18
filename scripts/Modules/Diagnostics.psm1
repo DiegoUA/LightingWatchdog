@@ -36,6 +36,40 @@ function Measure-HealthScore {
     return $score
 }
 
+function Get-LeakGrowthRate {
+    param(
+        [string]$DiagnosticsCsvPath,
+        [int]$Window
+    )
+
+    if (!(Test-Path $DiagnosticsCsvPath)) {
+        return 0
+    }
+
+    $data = Import-Csv $DiagnosticsCsvPath | Select-Object -Last $Window
+    if ($data.Count -lt 2) {
+        return 0
+    }
+
+    $first = $data[0]
+    $last  = $data[$data.Count - 1]
+
+    $firstConns = [double]$first.LightingServiceConns
+    $lastConns  = [double]$last.LightingServiceConns
+
+    $firstTime = [datetime]::Parse($first.Timestamp)
+    $lastTime  = [datetime]::Parse($last.Timestamp)
+
+    $deltaConns = $lastConns - $firstConns
+    $deltaSeconds = ($lastTime - $firstTime).TotalSeconds
+
+    if ($deltaSeconds -le 0) {
+        return 0
+    }
+
+    return [math]::Round($deltaConns / $deltaSeconds, 2)
+}
+
 function Invoke-Diagnostics {
     param(
         $Config
@@ -69,6 +103,8 @@ function Invoke-Diagnostics {
         RollingStdDev          = $null
         ZScore                 = $null
         TrendDirection         = $null
+        LeakGrowthRate         = $null
+        NonPagedTrend          = $null
     }
 
     # 1) TCP count
@@ -98,8 +134,8 @@ function Invoke-Diagnostics {
     }
 
     # 3) Nonpaged pool (safe)
-    $os   = Get-CimInstance Win32_OperatingSystem
-    $np   = [double]$os.NonPagedPoolSize
+    $os    = Get-CimInstance Win32_OperatingSystem
+    $np    = [double]$os.NonPagedPoolSize
     $npMax = [double]$os.NonPagedPoolQuota
 
     if (-not $npMax -or $npMax -le 0 -or $npMax -lt $np) {
@@ -147,9 +183,11 @@ function Invoke-Diagnostics {
     Write-Log $logFile "Health Score: $($result.HealthScore)"
 
     # 6) Trend analysis
-    $trendCsvPath = "$exportFolder\\HealthTrend.csv"
-    $trendData    = Get-TrendData -CsvPath $trendCsvPath -Window $Config.TrendWindow
-    $trend        = Measure-Trend -CurrentScore $result.HealthScore -TrendData $trendData
+    $trendCsvPath      = "$exportFolder\\HealthTrend.csv"
+    $diagnosticsCsvPath = "$exportFolder\\diagnostics.csv"
+
+    $trendData = Get-TrendData -CsvPath $trendCsvPath -Window $Config.TrendWindow
+    $trend     = Measure-Trend -CurrentScore $result.HealthScore -TrendData $trendData
 
     $result.RollingAverage = $trend.RollingAverage
     $result.RollingStdDev  = $trend.RollingStdDev
@@ -158,22 +196,50 @@ function Invoke-Diagnostics {
 
     Write-Log $logFile "Trend: Avg=$($trend.RollingAverage), StdDev=$($trend.RollingStdDev), Z=$($trend.ZScore), Dir=$($trend.TrendDirection)"
 
+    # 7) Leak growth rate
+    $result.LeakGrowthRate = Get-LeakGrowthRate -DiagnosticsCsvPath $diagnosticsCsvPath -Window $Config.TrendWindow
+    Write-Log $logFile "Leak growth rate: $($result.LeakGrowthRate) connections/sec"
+
+    # 8) Nonpaged trend (simple)
+    if ($trendData -ne $null -and $trendData.Count -ge 3) {
+        $npValues = $trendData.NonPagedPercent | ForEach-Object { [double]$_ }
+        $npAvg = ($npValues | Measure-Object -Average).Average
+        $npDelta = $result.NonPagedPercent - $npAvg
+
+        if ($npDelta -gt 5) {
+            $result.NonPagedTrend = "Degrading"
+        } elseif ($npDelta -lt -5) {
+            $result.NonPagedTrend = "Improving"
+        } else {
+            $result.NonPagedTrend = "Stable"
+        }
+    } else {
+        $result.NonPagedTrend = "Unknown"
+    }
+
+    Write-Log $logFile "Nonpaged trend: $($result.NonPagedTrend)"
+
+    # 9) Predictive alerts
     if ($Config.EnablePredictiveAlerts) {
         if ([math]::Abs($trend.ZScore) -ge 2) {
             Write-Log $logFile "ANOMALY: Health score deviates significantly from trend (Z=$($trend.ZScore))."
             Show-Alert "Health anomaly detected (Z=$($trend.ZScore)). Trend: $($trend.TrendDirection)." "LightingWatchdog Trend" $Config.EnablePopups
         }
+
+        if ($result.LeakGrowthRate -gt 10) {
+            Write-Log $logFile "PREDICTIVE: Leak growth rate high ($($result.LeakGrowthRate) connections/sec)."
+        }
     }
 
-    # 7) JSON export
+    # 10) JSON export
     if ($Config.EnableJsonExport) {
         $jsonPath = "$exportFolder\\diag_$timestamp.json"
         $result | ConvertTo-Json -Depth 4 | Out-File $jsonPath -Encoding UTF8
     }
 
-    # 8) CSV export (diagnostics)
+    # 11) CSV export (diagnostics)
     if ($Config.EnableCsvExport) {
-        $csvPath = "$exportFolder\\diagnostics.csv"
+        $csvPath = $diagnosticsCsvPath
         $obj = New-Object PSObject -Property $result
 
         if (!(Test-Path $csvPath)) {
@@ -183,7 +249,7 @@ function Invoke-Diagnostics {
         }
     }
 
-    # 9) HealthTrend.csv export
+    # 12) HealthTrend.csv export
     $trendRow = New-Object PSObject -Property @{
         Timestamp      = $result.Timestamp
         HealthScore    = $result.HealthScore
@@ -191,6 +257,8 @@ function Invoke-Diagnostics {
         RollingStdDev  = $result.RollingStdDev
         ZScore         = $result.ZScore
         TrendDirection = $result.TrendDirection
+        NonPagedPercent= $result.NonPagedPercent
+        NonPagedTrend  = $result.NonPagedTrend
     }
 
     if (!(Test-Path $trendCsvPath)) {
@@ -202,4 +270,4 @@ function Invoke-Diagnostics {
     return $logFile
 }
 
-Export-ModuleMember -Function Invoke-Diagnostics, Measure-HealthScore
+Export-ModuleMember -Function Invoke-Diagnostics, Measure-HealthScore, Get-LeakGrowthRate

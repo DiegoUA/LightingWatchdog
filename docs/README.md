@@ -43,7 +43,17 @@ LightingWatchdog is a modular Windows diagnostic and watchdog system designed to
 
 - Kernel memory pressure
 
-From v2.x, it supports configuration, modular diagnostics, watchdog mode, structured log export, Service Health Scoring, and trend/anomaly analysis.
+From v2.x, it supports configuration, modular diagnostics, watchdog mode, structured log export, Service Health Scoring, trend/anomaly analysis, and from v2.4:
+
+- Restart reason tracking
+
+- Leak growth rate measurement
+
+- Kernel memory pressure trend
+
+- Cooldown logic to avoid restart storms
+
+- Optional webhook notifications (Telegram/Discord via HTTP POST)
 
 ---
 
@@ -61,7 +71,8 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 | **v2.0** | 2026‑08‑18 | Modular architecture, config file, unified logging, service abstraction. |
 | **v2.1** | 2026‑08‑18 | Added JSON and CSV export of diagnostic runs. |
 | **v2.2** | 2026‑08‑18 | Service Health Score (0–100). |
-| **v2.3** | 2026‑08‑18 | Approved verbs, trend engine, anomaly detection, HealthTrend export. |
+| **v2.3** | 2026‑08‑19 | Approved verbs, trend engine, anomaly detection, HealthTrend export. |
+| **v2.4** | 2026‑08‑19 | Restart tracking, leak growth rate, kernel trend, cooldown, webhook notifications. |
 
 ---
 
@@ -79,13 +90,17 @@ Continuous watchdog mode:
 powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1 -Watchdog
 ```
 
-Exports:
+---
 
-JSON: logs/export/*.json
+## 📊 Exports
+
+JSON diagnostics: logs/export/diag_*.json
 
 Diagnostics CSV: logs/export/diagnostics.csv
 
 Health trend CSV: logs/export/HealthTrend.csv
+
+Restart events CSV: logs/export/RestartEvents.csv
 
 ---
 

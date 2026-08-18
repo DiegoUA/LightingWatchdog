@@ -9,6 +9,10 @@
     "EnableCsvExport": true,
     "TrendWindow": 20,
     "EnablePredictiveAlerts": true,
+    "CooldownSeconds": 300,
+    "EnableWebhooks": false,
+    "WebhookUrl": "",
+    "WebhookMinHealthScore": 60,
 
     "Weights": {
         "LightingLeak": 40,

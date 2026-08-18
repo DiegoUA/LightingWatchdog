@@ -23,4 +23,23 @@ function Show-Alert {
     }
 }
 
-Export-ModuleMember -Function Get-Config, Write-Log, Show-Alert
+function Send-WebhookNotification {
+    param(
+        [string]$WebhookUrl,
+        [hashtable]$Payload,
+        [bool]$EnableWebhooks
+    )
+
+    if (-not $EnableWebhooks -or [string]::IsNullOrWhiteSpace($WebhookUrl)) {
+        return
+    }
+
+    try {
+        $json = $Payload | ConvertTo-Json -Depth 4
+        Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType "application/json"
+    } catch {
+        # Best-effort only; failures are ignored
+    }
+}
+
+Export-ModuleMember -Function Get-Config, Write-Log, Show-Alert, Send-WebhookNotification
