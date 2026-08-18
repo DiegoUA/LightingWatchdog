@@ -83,6 +83,10 @@ function Invoke-Diagnostics {
     $logFolder    = "..\\logs"
     $exportFolder = "..\\logs\\export"
 
+    if (!(Test-Path $logFolder)) {
+        New-Item -ItemType Directory -Path $logFolder | Out-Null
+    }
+
     if (!(Test-Path $exportFolder)) {
         New-Item -ItemType Directory -Path $exportFolder | Out-Null
     }

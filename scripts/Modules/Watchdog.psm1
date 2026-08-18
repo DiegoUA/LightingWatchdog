@@ -67,8 +67,8 @@ function Update-Heartbeat {
     $heartbeatPath = "$logFolder\\heartbeat.json"
 
     $obj = @{
-        LastHeartbeat     = $LastHeartbeat.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        LastRestart       = $LastRestart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        LastHeartbeat     = $LastHeartbeat.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
+        LastRestart       = $LastRestart.ToUniversalTime().ToString("yyyy-MM-ddTHH-mm-ssZ")
         WatchdogHealth    = $WatchdogHealth
         CycleTimeSeconds  = $CycleTimeSeconds
     }
@@ -86,7 +86,6 @@ function Check-Quarantine {
         return $false
     }
 
-    # purge old history
     $windowStart = $Now.AddMinutes(-$Config.QuarantineWindowMinutes)
     $global:RestartHistory = $global:RestartHistory | Where-Object { $_ -ge $windowStart }
 
@@ -110,7 +109,6 @@ function Apply-AutoKill {
     foreach ($name in $Config.AutoKillProcesses) {
         $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($proc) {
-            $cpu = $proc.CPU
             $memMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
 
             if ($memMB -gt $Config.AutoKillMemThresholdMB) {
@@ -132,23 +130,21 @@ function Start-Watchdog {
 
     Show-Alert "LightingWatchdog started in continuous mode." "Watchdog" $Config.EnablePopups
 
-    $lastHeartbeat = Get-Date
-    $lastRestart   = Get-Date
-    $watchdogHealth = 100
+    $lastHeartbeat   = Get-Date
+    $lastRestart     = Get-Date
+    $watchdogHealth  = 100
 
     while ($true) {
 
         $cycleStart = Get-Date
 
-        # Run diagnostics
         $logFile = Invoke-Diagnostics -Config $Config
 
-        # Auto-kill
         Apply-AutoKill -Config $Config -LogFile $logFile
 
-        # Load latest JSON
         $exportFolder = "..\\logs\\export"
-        $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" | Sort-Object Name -Descending | Select-Object -First 1
+        $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" |
+                      Sort-Object Name -Descending | Select-Object -First 1
 
         if ($latestJson) {
             $data = Get-Content $latestJson.FullName | ConvertFrom-Json
@@ -169,7 +165,6 @@ function Start-Watchdog {
 
             $now = Get-Date
 
-            # Quarantine check
             $inQuarantine = Check-Quarantine -Now $now -Config $Config
             if ($inQuarantine) {
                 Write-Log $logFile "QUARANTINE ACTIVE: Skipping restart of LightingService."
@@ -178,7 +173,6 @@ function Start-Watchdog {
 
             if ($needRestart) {
 
-                # Cooldown logic
                 if ($global:LastRestartTimestamp -ne $null) {
                     $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
                     if ($elapsed -lt $Config.CooldownSeconds) {
@@ -213,7 +207,6 @@ function Start-Watchdog {
             }
         }
 
-        # Heartbeat + drift
         $cycleEnd = Get-Date
         $cycleDuration = ($cycleEnd - $cycleStart).TotalSeconds
         $drift = $cycleDuration - $Config.WatchdogIntervalSeconds

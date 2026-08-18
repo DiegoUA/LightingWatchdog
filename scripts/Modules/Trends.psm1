@@ -28,8 +28,12 @@ function Measure-Trend {
     }
 
     $scores = $TrendData.HealthScore | ForEach-Object { [double]$_ }
+
+    # Manual stddev for PS 5.1
     $avg = ($scores | Measure-Object -Average).Average
-    $std = ($scores | Measure-Object -StandardDeviation).StandardDeviation
+    $variance = ($scores | ForEach-Object { ($_ - $avg) * ($_ - $avg) } |
+                 Measure-Object -Sum).Sum / $scores.Count
+    $std = [math]::Sqrt($variance)
 
     if ($std -eq 0) { $std = 0.0001 }
 

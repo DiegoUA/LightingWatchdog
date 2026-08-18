@@ -9,12 +9,10 @@ function Get-Timestamp {
         [string]$TimestampFormat
     )
 
-    $now =
-        if ($UseUtc) { (Get-Date).ToUniversalTime() }
-        else { Get-Date }
+    $now = if ($UseUtc) { (Get-Date).ToUniversalTime() } else { Get-Date }
 
     switch ($TimestampFormat) {
-        "ISO8601" { return $now.ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        "ISO8601" { return $now.ToString("yyyy-MM-ddTHH-mm-ssZ") }  # filesystem-safe
         default   { return $now.ToString("yyyy-MM-dd_HH-mm-ss") }
     }
 }
