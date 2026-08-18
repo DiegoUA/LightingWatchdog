@@ -55,8 +55,8 @@ function Get-LeakGrowthRate {
     $last  = $data[$data.Count - 1]
 
     try {
-        $firstTime = [datetime]::ParseExact($first.Timestamp, "yyyy-MM-dd_HH-mm-ss", $null)
-        $lastTime  = [datetime]::ParseExact($last.Timestamp, "yyyy-MM-dd_HH-mm-ss", $null)
+        $firstTime = [datetime]::Parse($first.Timestamp)
+        $lastTime  = [datetime]::Parse($last.Timestamp)
     } catch {
         return 0
     }
@@ -79,7 +79,7 @@ function Invoke-Diagnostics {
         $Config
     )
 
-    $timestamp    = (Get-Date).ToString("yyyy-MM-dd_HH-mm-ss")
+    $timestamp    = Get-Timestamp -UseUtc $Config.UseUtc -TimestampFormat $Config.TimestampFormat
     $logFolder    = "..\\logs"
     $exportFolder = "..\\logs\\export"
 
@@ -187,7 +187,7 @@ function Invoke-Diagnostics {
     Write-Log $logFile "Health Score: $($result.HealthScore)"
 
     # 6) Trend analysis
-    $trendCsvPath      = "$exportFolder\\HealthTrend.csv"
+    $trendCsvPath       = "$exportFolder\\HealthTrend.csv"
     $diagnosticsCsvPath = "$exportFolder\\diagnostics.csv"
 
     $trendData = Get-TrendData -CsvPath $trendCsvPath -Window $Config.TrendWindow

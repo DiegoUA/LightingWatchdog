@@ -2,6 +2,7 @@ Import-Module "..\\scripts\\Modules\\Utils.psm1"
 Import-Module "..\\scripts\\Modules\\Diagnostics.psm1"
 
 $global:LastRestartTimestamp = $null
+$global:RestartHistory = @()
 
 function Write-RestartEvent {
     param(
@@ -50,6 +51,80 @@ function Write-RestartEvent {
     }
 }
 
+function Update-Heartbeat {
+    param(
+        [datetime]$LastHeartbeat,
+        [datetime]$LastRestart,
+        [int]$WatchdogHealth,
+        [int]$CycleTimeSeconds
+    )
+
+    $logFolder = "..\\logs"
+    if (!(Test-Path $logFolder)) {
+        New-Item -ItemType Directory -Path $logFolder | Out-Null
+    }
+
+    $heartbeatPath = "$logFolder\\heartbeat.json"
+
+    $obj = @{
+        LastHeartbeat     = $LastHeartbeat.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        LastRestart       = $LastRestart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        WatchdogHealth    = $WatchdogHealth
+        CycleTimeSeconds  = $CycleTimeSeconds
+    }
+
+    $obj | ConvertTo-Json -Depth 4 | Out-File $heartbeatPath -Encoding UTF8
+}
+
+function Check-Quarantine {
+    param(
+        [datetime]$Now,
+        $Config
+    )
+
+    if (-not $Config.EnableQuarantine) {
+        return $false
+    }
+
+    # purge old history
+    $windowStart = $Now.AddMinutes(-$Config.QuarantineWindowMinutes)
+    $global:RestartHistory = $global:RestartHistory | Where-Object { $_ -ge $windowStart }
+
+    if ($global:RestartHistory.Count -ge $Config.QuarantineRestartLimit) {
+        return $true
+    }
+
+    return $false
+}
+
+function Apply-AutoKill {
+    param(
+        $Config,
+        [string]$LogFile
+    )
+
+    if (-not $Config.EnableAutoKill) {
+        return
+    }
+
+    foreach ($name in $Config.AutoKillProcesses) {
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if ($proc) {
+            $cpu = $proc.CPU
+            $memMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
+
+            if ($memMB -gt $Config.AutoKillMemThresholdMB) {
+                Write-Log $LogFile "AUTO-KILL: $name using $memMB MB. Terminating."
+                try {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                } catch {
+                    Write-Log $LogFile "AUTO-KILL FAILED: $name - $_"
+                }
+            }
+        }
+    }
+}
+
 function Start-Watchdog {
     param(
         $Config
@@ -57,10 +132,19 @@ function Start-Watchdog {
 
     Show-Alert "LightingWatchdog started in continuous mode." "Watchdog" $Config.EnablePopups
 
+    $lastHeartbeat = Get-Date
+    $lastRestart   = Get-Date
+    $watchdogHealth = 100
+
     while ($true) {
+
+        $cycleStart = Get-Date
 
         # Run diagnostics
         $logFile = Invoke-Diagnostics -Config $Config
+
+        # Auto-kill
+        Apply-AutoKill -Config $Config -LogFile $logFile
 
         # Load latest JSON
         $exportFolder = "..\\logs\\export"
@@ -68,13 +152,6 @@ function Start-Watchdog {
 
         if ($latestJson) {
             $data = Get-Content $latestJson.FullName | ConvertFrom-Json
-
-            # v2.4.1 timestamp fix
-            try {
-                $dataTime = [datetime]::ParseExact($data.Timestamp, "yyyy-MM-dd_HH-mm-ss", $null)
-            } catch {
-                $dataTime = Get-Date
-            }
 
             $needRestart = $false
             $reason = $null
@@ -90,10 +167,18 @@ function Start-Watchdog {
                 $reason = "Storm"
             }
 
+            $now = Get-Date
+
+            # Quarantine check
+            $inQuarantine = Check-Quarantine -Now $now -Config $Config
+            if ($inQuarantine) {
+                Write-Log $logFile "QUARANTINE ACTIVE: Skipping restart of LightingService."
+                $needRestart = $false
+            }
+
             if ($needRestart) {
 
                 # Cooldown logic
-                $now = Get-Date
                 if ($global:LastRestartTimestamp -ne $null) {
                     $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
                     if ($elapsed -lt $Config.CooldownSeconds) {
@@ -116,6 +201,8 @@ function Start-Watchdog {
 
                         Write-Log $logFile "LightingService restarted successfully."
                         $global:LastRestartTimestamp = Get-Date
+                        $lastRestart = $global:LastRestartTimestamp
+                        $global:RestartHistory += $lastRestart
 
                         Write-RestartEvent -Reason $reason -Result $data -Config $Config
 
@@ -125,6 +212,21 @@ function Start-Watchdog {
                 }
             }
         }
+
+        # Heartbeat + drift
+        $cycleEnd = Get-Date
+        $cycleDuration = ($cycleEnd - $cycleStart).TotalSeconds
+        $drift = $cycleDuration - $Config.WatchdogIntervalSeconds
+
+        if ([math]::Abs($drift) -gt $Config.ClockDriftThresholdSeconds) {
+            Write-Log $logFile "CLOCK DRIFT: Cycle duration $cycleDuration s (expected $($Config.WatchdogIntervalSeconds) s)."
+            $watchdogHealth = [math]::Max(0, $watchdogHealth - 5)
+        } else {
+            $watchdogHealth = [math]::Min(100, $watchdogHealth + 1)
+        }
+
+        $lastHeartbeat = Get-Date
+        Update-Heartbeat -LastHeartbeat $lastHeartbeat -LastRestart $lastRestart -WatchdogHealth $watchdogHealth -CycleTimeSeconds $Config.WatchdogIntervalSeconds
 
         Start-Sleep -Seconds $Config.WatchdogIntervalSeconds
     }

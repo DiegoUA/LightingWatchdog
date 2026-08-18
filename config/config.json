@@ -4,15 +4,31 @@
     "StormThreshold": 200,
     "WatchdogIntervalSeconds": 60,
     "MaxLogFiles": 20,
+
     "EnablePopups": true,
     "EnableJsonExport": true,
     "EnableCsvExport": true,
     "TrendWindow": 20,
     "EnablePredictiveAlerts": true,
+
     "CooldownSeconds": 300,
     "EnableWebhooks": false,
     "WebhookUrl": "",
     "WebhookMinHealthScore": 60,
+
+    "TimestampFormat": "ISO8601",
+    "UseUtc": true,
+    "ClockDriftThresholdSeconds": 2,
+
+    "EnableQuarantine": true,
+    "QuarantineRestartLimit": 3,
+    "QuarantineWindowMinutes": 10,
+    "QuarantineDurationMinutes": 30,
+
+    "EnableAutoKill": true,
+    "AutoKillProcesses": [ "LightingService" ],
+    "AutoKillCpuThreshold": 80,
+    "AutoKillMemThresholdMB": 500,
 
     "Weights": {
         "LightingLeak": 40,

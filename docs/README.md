@@ -73,6 +73,19 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 | **v2.2** | 2026‑08‑18 | Service Health Score (0–100). |
 | **v2.3** | 2026‑08‑19 | Approved verbs, trend engine, anomaly detection, HealthTrend export. |
 | **v2.4** | 2026‑08‑19 | Restart tracking, leak growth rate, kernel trend, cooldown, webhook notifications. |
+| **v2.4.1** | 2026‑08‑19 | Fixed timestamp parsing using ParseExact; stabilized leak growth rate; added full restart logic, cooldown, webhook support. |
+| **v2.5** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
+
+## Key v2.5 Features
+
+- ISO‑8601 timestamps (`yyyy-MM-ddTHH:mm:ssZ`)
+- Optional UTC mode
+- Watchdog heartbeat (`logs/heartbeat.json`)
+- Clock drift detection
+- Quarantine mode for LightingService
+- Auto‑kill for runaway processes
+- Watchdog health score
+- Existing leak, trend, health scoring, restart logic, webhooks, JSON/CSV exports.
 
 ---
 
