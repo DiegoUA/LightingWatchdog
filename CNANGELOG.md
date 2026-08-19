@@ -3,6 +3,43 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+# Changelog
+
+## v2.5.3 — 2026‑08‑19
+### Stability & Path‑Safety Release
+
+This version delivers a full path‑safety refactor across all modules, eliminating
+DriveNotFound errors, inconsistent logging behavior, and working‑directory
+dependencies. All modules now use `$PSScriptRoot` for deterministic path
+resolution, making the entire system stable under Task Scheduler, batch
+wrappers, and manual execution.
+
+### Added
+- Unified `Write-Log -File -Message` API across all modules.
+- Absolute path resolution for:
+  - logs/
+  - logs/export/
+  - logs/heartbeat.json
+  - config/config.json
+- Hardened module imports using `Join-Path $PSScriptRoot`.
+
+### Changed
+- Diagnostics, Watchdog, Trends, and Utils modules rewritten to remove all
+  relative paths.
+- NetworkDiag.ps1 updated to use absolute module imports.
+- Restart event logging and heartbeat updates now use stable absolute paths.
+- Improved consistency of JSON and CSV export behavior.
+
+### Fixed
+- `DriveNotFoundException` caused by relative paths resolving incorrectly when
+  the working directory contained prefixes like `OK`.
+- CSV append issues under certain execution contexts.
+- Watchdog drift detection occasionally reporting incorrect cycle durations.
+- Webhook payload inconsistencies for restart events.
+
+### Notes
+No configuration changes required. Existing `config.json` remains fully
+compatible.
 
 ## [2.5.2] - 2026-08-19
 ### Fixed

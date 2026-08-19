@@ -23,7 +23,19 @@ function Write-Log {
         [string]$File,
         [string]$Message
     )
-    $Message | Out-File $File -Append
+
+    # If caller passes a relative name, resolve it under ..\..\logs
+    if (-not [System.IO.Path]::IsPathRooted($File)) {
+        $logDir = Join-Path $PSScriptRoot "..\..\logs"
+
+        if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir | Out-Null
+        }
+
+        $File = Join-Path $logDir $File
+    }
+
+    $Message | Out-File -FilePath $File -Append -Encoding UTF8
 }
 
 function Show-Alert {

@@ -1,5 +1,5 @@
-Import-Module "$PSScriptRoot\Utils.psm1"
-Import-Module "$PSScriptRoot\Trends.psm1"
+Import-Module (Join-Path $PSScriptRoot "Utils.psm1") -Force
+Import-Module (Join-Path $PSScriptRoot "Trends.psm1") -Force
 
 function Measure-HealthScore {
     param($Result, $Config)
@@ -43,18 +43,21 @@ function Get-LeakGrowthRate {
 function Invoke-Diagnostics {
     param($Config)
 
-    $timestamp = Get-Timestamp -UseUtc $Config.UseUtc -TimestampFormat $Config.TimestampFormat
-
+    # --- Absolute folders ---
     $logFolder    = Join-Path $PSScriptRoot "..\..\logs"
     $exportFolder = Join-Path $logFolder "export"
 
     if (!(Test-Path $logFolder))    { New-Item -ItemType Directory -Path $logFolder | Out-Null }
     if (!(Test-Path $exportFolder)) { New-Item -ItemType Directory -Path $exportFolder | Out-Null }
 
-    $logFile = Join-Path $logFolder "NetworkDiag_$timestamp.txt"
-    "=== DIAGNOSTICS ($timestamp) ===`n" | Out-File $logFile
+    # --- Timestamp ---
+    $timestamp = Get-Timestamp -UseUtc $Config.UseUtc -TimestampFormat $Config.TimestampFormat
 
-    # --- result object ---
+    # --- Log file ---
+    $logFile = Join-Path $logFolder "NetworkDiag_$timestamp.txt"
+    "=== DIAGNOSTICS ($timestamp) ===`n" | Out-File $logFile -Encoding UTF8
+
+    # --- Result object ---
     $result = [ordered]@{
         Timestamp              = $timestamp
         TcpTotal               = $null
@@ -75,12 +78,12 @@ function Invoke-Diagnostics {
         NonPagedTrend          = $null
     }
 
-    # 1) TCP count
+    # --- TCP count ---
     $tcpTotal = (Get-NetTCPConnection).Count
     $result.TcpTotal = $tcpTotal
-    Write-Log $logFile "TCP connections: $tcpTotal"
+    Write-Log -File $logFile -Message "TCP connections: $tcpTotal"
 
-    # 2) LightingService leak detection
+    # --- LightingService leak detection ---
     $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
     if ($proc) {
         $pid   = $proc.Id
@@ -89,39 +92,39 @@ function Invoke-Diagnostics {
         $result.LightingServicePid   = $pid
         $result.LightingServiceConns = $conns
 
-        Write-Log $logFile "LightingService PID: $pid"
-        Write-Log $logFile "LightingService connections: $conns"
+        Write-Log -File $logFile -Message "LightingService PID: $pid"
+        Write-Log -File $logFile -Message "LightingService connections: $conns"
 
         if ($conns -gt $Config.LeakThreshold) {
             $result.LightingLeakDetected = $true
             Show-Alert "LightingService leak detected ($conns connections)" "LightingWatchdog" $Config.EnablePopups
-            Write-Log $logFile "LEAK DETECTED"
+            Write-Log -File $logFile -Message "LEAK DETECTED"
         }
     } else {
-        Write-Log $logFile "LightingService not running."
+        Write-Log -File $logFile -Message "LightingService not running."
     }
 
-    # 3) Nonpaged pool
+    # --- Nonpaged pool ---
     $os    = Get-CimInstance Win32_OperatingSystem
     $np    = [double]$os.NonPagedPoolSize
     $npMax = [double]$os.NonPagedPoolQuota
 
     if (-not $npMax -or $npMax -le 0 -or $npMax -lt $np) {
-        Write-Log $logFile "WARNING: NonPagedPoolQuota invalid. Using fallback."
+        Write-Log -File $logFile -Message "WARNING: NonPagedPoolQuota invalid. Using fallback."
         $npMax = [math]::Max($np, 1) * 2
     }
 
     $npPct = [math]::Round(($np / $npMax) * 100, 2)
     $result.NonPagedPercent = $npPct
-    Write-Log $logFile "Nonpaged pool: $npPct%"
+    Write-Log -File $logFile -Message "Nonpaged pool: $npPct%"
 
     if ($npPct -gt $Config.NonPagedPoolThreshold) {
         $result.NonPagedPressure = $true
         Show-Alert "Nonpaged pool high ($npPct%)" "Kernel Alert" $Config.EnablePopups
-        Write-Log $logFile "KERNEL PRESSURE DETECTED"
+        Write-Log -File $logFile -Message "KERNEL PRESSURE DETECTED"
     }
 
-    # 4) WebSocket storm
+    # --- WebSocket storm ---
     $tcp1 = (Get-NetTCPConnection).Count
     $udp1 = (Get-NetUDPEndpoint).Count
 
@@ -133,22 +136,22 @@ function Invoke-Diagnostics {
     $result.TcpNewPerSec = $tcp2 - $tcp1
     $result.UdpNewPerSec = $udp2 - $udp1
 
-    Write-Log $logFile "TCP/sec: $($result.TcpNewPerSec)"
-    Write-Log $logFile "UDP/sec: $($result.UdpNewPerSec)"
+    Write-Log -File $logFile -Message "TCP/sec: $($result.TcpNewPerSec)"
+    Write-Log -File $logFile -Message "UDP/sec: $($result.UdpNewPerSec)"
 
     if ($result.TcpNewPerSec -gt $Config.StormThreshold -or
         $result.UdpNewPerSec -gt $Config.StormThreshold) {
 
         $result.StormDetected = $true
         Show-Alert "WebSocket storm detected" "Storm Alert" $Config.EnablePopups
-        Write-Log $logFile "STORM DETECTED"
+        Write-Log -File $logFile -Message "STORM DETECTED"
     }
 
-    # 5) Health score
+    # --- Health score ---
     $result.HealthScore = Measure-HealthScore -Result $result -Config $Config
-    Write-Log $logFile "Health Score: $($result.HealthScore)"
+    Write-Log -File $logFile -Message "Health Score: $($result.HealthScore)"
 
-    # 6) Trend analysis
+    # --- Trend analysis ---
     $trendCsvPath       = Join-Path $exportFolder "HealthTrend.csv"
     $diagnosticsCsvPath = Join-Path $exportFolder "diagnostics.csv"
 
@@ -160,13 +163,13 @@ function Invoke-Diagnostics {
     $result.ZScore         = $trend.ZScore
     $result.TrendDirection = $trend.TrendDirection
 
-    Write-Log $logFile "Trend: Avg=$($trend.RollingAverage), StdDev=$($trend.RollingStdDev), Z=$($trend.ZScore), Dir=$($trend.TrendDirection)"
+    Write-Log -File $logFile -Message "Trend: Avg=$($trend.RollingAverage), StdDev=$($trend.RollingStdDev), Z=$($trend.ZScore), Dir=$($trend.TrendDirection)"
 
-    # 7) Leak growth rate
+    # --- Leak growth rate ---
     $result.LeakGrowthRate = Get-LeakGrowthRate -DiagnosticsCsvPath $diagnosticsCsvPath -Window $Config.TrendWindow
-    Write-Log $logFile "Leak growth rate: $($result.LeakGrowthRate) connections/sec"
+    Write-Log -File $logFile -Message "Leak growth rate: $($result.LeakGrowthRate) connections/sec"
 
-    # 8) Nonpaged trend
+    # --- Nonpaged trend ---
     if ($trendData -ne $null -and $trendData.Count -ge 3) {
         $npValues = $trendData.NonPagedPercent | ForEach-Object { [double]$_ }
         $npAvg = ($npValues | Measure-Object -Average).Average
@@ -180,27 +183,27 @@ function Invoke-Diagnostics {
         $result.NonPagedTrend = "Unknown"
     }
 
-    Write-Log $logFile "Nonpaged trend: $($result.NonPagedTrend)"
+    Write-Log -File $logFile -Message "Nonpaged trend: $($result.NonPagedTrend)"
 
-    # 9) Predictive alerts
+    # --- Predictive alerts ---
     if ($Config.EnablePredictiveAlerts) {
         if ([math]::Abs($trend.ZScore) -ge 2) {
-            Write-Log $logFile "ANOMALY: Health score deviates significantly (Z=$($trend.ZScore))."
+            Write-Log -File $logFile -Message "ANOMALY: Health score deviates significantly (Z=$($trend.ZScore))."
             Show-Alert "Health anomaly detected (Z=$($trend.ZScore)). Trend: $($trend.TrendDirection)." "LightingWatchdog Trend" $Config.EnablePopups
         }
 
         if ($result.LeakGrowthRate -gt 10) {
-            Write-Log $logFile "PREDICTIVE: Leak growth rate high ($($result.LeakGrowthRate) connections/sec)."
+            Write-Log -File $logFile -Message "PREDICTIVE: Leak growth rate high ($($result.LeakGrowthRate) connections/sec)."
         }
     }
 
-    # 10) JSON export
+    # --- JSON export ---
     if ($Config.EnableJsonExport) {
         $jsonPath = Join-Path $exportFolder "diag_$timestamp.json"
         $result | ConvertTo-Json -Depth 4 | Out-File $jsonPath -Encoding UTF8
     }
 
-    # 11) CSV export
+    # --- CSV export ---
     if ($Config.EnableCsvExport) {
         $obj = New-Object PSObject -Property $result
 
@@ -211,7 +214,7 @@ function Invoke-Diagnostics {
         }
     }
 
-    # 12) HealthTrend.csv export
+    # --- HealthTrend.csv export ---
     $trendRow = New-Object PSObject -Property @{
         Timestamp      = $result.Timestamp
         HealthScore    = $result.HealthScore

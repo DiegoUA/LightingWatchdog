@@ -1,3 +1,5 @@
+Import-Module (Join-Path $PSScriptRoot "Utils.psm1") -Force
+
 function Get-TrendData {
     param(
         [string]$CsvPath,

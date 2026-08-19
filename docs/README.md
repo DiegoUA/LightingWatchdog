@@ -77,6 +77,7 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 | **v2.5** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
 | **v2.5.1** | 2026‑08‑19 | Filesystem-safe timestamps, PS 5.1 stddev fix, ensured logs folder creation. |
 | **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, ``$PSScriptRoot`` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
+| **v2.5.3** | 2026‑08‑19 | Unified ``Write-Log ``-File ``-Message``, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
 
 ## Key Features
 
@@ -115,6 +116,8 @@ powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1 -Watchdog
 
 ## 📊 Exports
 
+LightingWatchdog automatically creates the following files during operation:
+
 JSON diagnostics: logs/export/diag_*.json
 
 Diagnostics CSV: logs/export/diagnostics.csv
@@ -122,6 +125,8 @@ Diagnostics CSV: logs/export/diagnostics.csv
 Health trend CSV: logs/export/HealthTrend.csv
 
 Restart events CSV: logs/export/RestartEvents.csv
+
+Watchdog heartbeat: logs/heartbeat.json
 
 ---
 

@@ -1,10 +1,14 @@
 param([switch]$Watchdog)
 
-Import-Module "$PSScriptRoot\Modules\Utils.psm1"
-Import-Module "$PSScriptRoot\Modules\Diagnostics.psm1"
-Import-Module "$PSScriptRoot\Modules\Watchdog.psm1"
-Import-Module "$PSScriptRoot\Modules\Trends.psm1"
+# Resolve module directory absolutely
+$ModuleDir = Join-Path $PSScriptRoot "Modules"
 
+Import-Module (Join-Path $ModuleDir "Utils.psm1") -Force
+Import-Module (Join-Path $ModuleDir "Diagnostics.psm1") -Force
+Import-Module (Join-Path $ModuleDir "Watchdog.psm1") -Force
+Import-Module (Join-Path $ModuleDir "Trends.psm1") -Force
+
+# Load config.json using Utils.psm1 (already path-safe)
 $Config = Get-Config
 
 if ($Watchdog) {

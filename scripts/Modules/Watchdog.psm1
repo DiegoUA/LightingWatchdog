@@ -1,5 +1,5 @@
-Import-Module "$PSScriptRoot\Utils.psm1"
-Import-Module "$PSScriptRoot\Diagnostics.psm1"
+Import-Module (Join-Path $PSScriptRoot "Utils.psm1") -Force
+Import-Module (Join-Path $PSScriptRoot "Diagnostics.psm1") -Force
 
 $global:LastRestartTimestamp = $null
 $global:RestartHistory = @()
@@ -38,14 +38,14 @@ function Write-RestartEvent {
 
     if ($Config.EnableWebhooks -and $Result.HealthScore -lt $Config.WebhookMinHealthScore) {
         $payload = @{
-            Timestamp      = $Result.Timestamp
-            Event          = "LightingServiceRestart"
-            Reason         = $Reason
-            HealthScore    = $Result.HealthScore
-            TcpTotal       = $Result.TcpTotal
-            LightingConns  = $Result.LightingServiceConns
-            NonPagedPercent= $Result.NonPagedPercent
-            LeakGrowthRate = $Result.LeakGrowthRate
+            Timestamp       = $Result.Timestamp
+            Event           = "LightingServiceRestart"
+            Reason          = $Reason
+            HealthScore     = $Result.HealthScore
+            TcpTotal        = $Result.TcpTotal
+            LightingConns   = $Result.LightingServiceConns
+            NonPagedPercent = $Result.NonPagedPercent
+            LeakGrowthRate  = $Result.LeakGrowthRate
         }
         Send-WebhookNotification -WebhookUrl $Config.WebhookUrl -Payload $payload -EnableWebhooks $Config.EnableWebhooks
     }
@@ -112,11 +112,11 @@ function Apply-AutoKill {
             $memMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
 
             if ($memMB -gt $Config.AutoKillMemThresholdMB) {
-                Write-Log $LogFile "AUTO-KILL: $name using $memMB MB. Terminating."
+                Write-Log -File $LogFile -Message "AUTO-KILL: $name using $memMB MB. Terminating."
                 try {
                     Stop-Process -Id $proc.Id -Force -ErrorAction Stop
                 } catch {
-                    Write-Log $LogFile "AUTO-KILL FAILED: $name - $_"
+                    Write-Log -File $LogFile -Message "AUTO-KILL FAILED: $name - $_"
                 }
             }
         }
@@ -167,7 +167,7 @@ function Start-Watchdog {
 
             $inQuarantine = Check-Quarantine -Now $now -Config $Config
             if ($inQuarantine) {
-                Write-Log $logFile "QUARANTINE ACTIVE: Skipping restart of LightingService."
+                Write-Log -File $logFile -Message "QUARANTINE ACTIVE: Skipping restart of LightingService."
                 $needRestart = $false
             }
 
@@ -176,13 +176,13 @@ function Start-Watchdog {
                 if ($global:LastRestartTimestamp -ne $null) {
                     $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
                     if ($elapsed -lt $Config.CooldownSeconds) {
-                        Write-Log $logFile "Cooldown active ($elapsed s < $($Config.CooldownSeconds) s). Skipping restart."
+                        Write-Log -File $logFile -Message "Cooldown active ($elapsed s < $($Config.CooldownSeconds) s). Skipping restart."
                         $needRestart = $false
                     }
                 }
 
                 if ($needRestart) {
-                    Write-Log $logFile "Restarting LightingService due to $reason."
+                    Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
 
                     try {
                         $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
@@ -193,7 +193,7 @@ function Start-Watchdog {
                         Start-Sleep -Seconds 2
                         Start-Service -Name LightingService -ErrorAction Stop
 
-                        Write-Log $logFile "LightingService restarted successfully."
+                        Write-Log -File $logFile -Message "LightingService restarted successfully."
                         $global:LastRestartTimestamp = Get-Date
                         $lastRestart = $global:LastRestartTimestamp
                         $global:RestartHistory += $lastRestart
@@ -201,7 +201,7 @@ function Start-Watchdog {
                         Write-RestartEvent -Reason $reason -Result $data -Config $Config
 
                     } catch {
-                        Write-Log $logFile "Failed to restart LightingService: $_"
+                        Write-Log -File $logFile -Message "Failed to restart LightingService: $_"
                     }
                 }
             }
@@ -212,7 +212,7 @@ function Start-Watchdog {
         $drift = $cycleDuration - $Config.WatchdogIntervalSeconds
 
         if ([math]::Abs($drift) -gt $Config.ClockDriftThresholdSeconds) {
-            Write-Log $logFile "CLOCK DRIFT: Cycle duration $cycleDuration s (expected $($Config.WatchdogIntervalSeconds) s)."
+            Write-Log -File $logFile -Message "CLOCK DRIFT: Cycle duration $cycleDuration s (expected $($Config.WatchdogIntervalSeconds) s)."
             $watchdogHealth = [math]::Max(0, $watchdogHealth - 5)
         } else {
             $watchdogHealth = [math]::Min(100, $watchdogHealth + 1)
