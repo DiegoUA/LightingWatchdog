@@ -31,5 +31,4 @@ jobs:
           tag_name: ${{ github.ref }}
           name: Release ${{ github.ref }}
           body: ${{ steps.notes.outputs.body }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
