@@ -1,14 +1,27 @@
 param([switch]$Watchdog)
 
-# Resolve module directory absolutely
-$ModuleDir = Join-Path $PSScriptRoot "Modules"
+# --- Resolve absolute script directory ---
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
+$ModuleDir = Join-Path $ScriptDir "Modules"
 
-Import-Module (Join-Path $ModuleDir "Utils.psm1") -Force
-Import-Module (Join-Path $ModuleDir "Diagnostics.psm1") -Force
-Import-Module (Join-Path $ModuleDir "Watchdog.psm1") -Force
-Import-Module (Join-Path $ModuleDir "Trends.psm1") -Force
+Write-Host "ScriptDir = $ScriptDir"
+Write-Host "ModuleDir = $ModuleDir"
 
-# Load config.json using Utils.psm1 (already path-safe)
+# --- Import modules in logical dependency order ---
+$modules = @("Utils.psm1", "Trends.psm1", "Diagnostics.psm1", "Watchdog.psm1")
+
+foreach ($m in $modules) {
+    $path = Join-Path $ModuleDir $m
+    Write-Host "Importing $path"
+    Import-Module $path -Scope Global -Force -ErrorAction Stop
+}
+
+# --- Verify loaded functions ---
+Write-Host "Loaded functions:"
+Get-Command Get-Config, Invoke-Diagnostics, Start-Watchdog | Format-Table Name, Module
+
+# --- Main execution ---
 $Config = Get-Config
 
 if ($Watchdog) {

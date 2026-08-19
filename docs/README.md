@@ -20,13 +20,24 @@ LightingWatchdog/
 │   └── config.json
 │
 ├── logs/
+│   ├── export/
+│   │   ├── diag_*.json
+│   │   ├── diagnostics.csv
+│   │   ├── HealthTrend.csv
+│   │   └── RestartEvents.csv
+│   ├── heartbeat.json
 │   └── .gitkeep
+│
+├── .github/
+│   └── workflows/
+│       └── release.yml
 │
 ├── docs/
 │   └── README.md
 │
 ├── .gitignore
 └── LICENSE
+
 ```
 
 ## ⚙️ Description
@@ -43,7 +54,21 @@ LightingWatchdog is a modular Windows diagnostic and watchdog system designed to
 
 - Kernel memory pressure
 
-From v2.x, it supports configuration, modular diagnostics, watchdog mode, structured log export, Service Health Scoring, trend/anomaly analysis, and from v2.4:
+From v2.x, the system supports:
+
+- Modular diagnostics
+
+- Configurable thresholds
+
+- Continuous watchdog mode
+
+- Structured JSON/CSV exports
+
+- Service Health Scoring
+
+- Trend and anomaly analysis
+
+From v2.4+, the system adds:
 
 - Restart reason tracking
 
@@ -54,6 +79,22 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 - Cooldown logic to avoid restart storms
 
 - Optional webhook notifications (Telegram/Discord via HTTP POST)
+
+From v2.5+, the system includes:
+
+- ISO‑8601 timestamps
+
+- Optional UTC mode
+
+- Heartbeat file (logs/heartbeat.json)
+
+- Clock drift detection
+
+- Quarantine mode
+
+- Auto‑kill for runaway processes
+
+- Watchdog health scoring
 
 ---
 
@@ -78,6 +119,7 @@ From v2.x, it supports configuration, modular diagnostics, watchdog mode, struct
 | **v2.5.1** | 2026‑08‑19 | Filesystem-safe timestamps, PS 5.1 stddev fix, ensured logs folder creation. |
 | **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, ``$PSScriptRoot`` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
 | **v2.5.3** | 2026‑08‑19 | Unified ``Write-Log ``-File ``-Message``, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
+| **v2.5.4** | 2026‑08‑19 | Fixed watchdog cycle timing, stabilized module imports, corrected Write-Log path handling, improved continuous-mode reliability. |
 
 ## Key Features
 

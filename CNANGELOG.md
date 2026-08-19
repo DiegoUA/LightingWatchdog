@@ -5,6 +5,22 @@ All notable changes to LightingWatchdog are documented here.
 ---
 # Changelog
 
+## [2.5.4] - 2026-08-19
+### Fixed
+- Corrected watchdog cycle timing by measuring the full interval including the sleep phase.
+- Eliminated false CLOCK DRIFT warnings caused by measuring only diagnostic execution time.
+- Stabilized module imports in PowerShell 7 using ordered global imports in NetworkDiag.ps1.
+- Ensured all modules (Utils, Trends, Diagnostics, Watchdog) load consistently in -File execution mode.
+- Fixed Write-Log path handling by replacing incorrect implementation with a safe, positional-parameter-aware version.
+
+### Changed
+- Reorganized Start-Watchdog loop structure for predictable timing and stable drift detection.
+- Updated NetworkDiag.ps1 to use deterministic module import order and global scope imports.
+- Updated Write-Log to correctly resolve relative paths under ..\..\logs and handle parameter swapping.
+
+### Notes
+- Logging errors caused by invalid file paths (e.g., "OK") are now resolved.
+
 ## v2.5.3 — 2026‑08‑19
 ### Stability & Path‑Safety Release
 

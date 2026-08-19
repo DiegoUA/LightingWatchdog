@@ -1,6 +1,3 @@
-Import-Module (Join-Path $PSScriptRoot "Utils.psm1") -Force
-Import-Module (Join-Path $PSScriptRoot "Trends.psm1") -Force
-
 function Measure-HealthScore {
     param($Result, $Config)
 
@@ -235,4 +232,4 @@ function Invoke-Diagnostics {
     return $logFile
 }
 
-Export-ModuleMember -Function Invoke-Diagnostics, Measure-HealthScore, Get-LeakGrowthRate
+Export-ModuleMember -Function Get-LeakGrowthRate, Invoke-Diagnostics, Measure-HealthScore   

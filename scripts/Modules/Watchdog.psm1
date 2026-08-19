@@ -1,6 +1,3 @@
-Import-Module (Join-Path $PSScriptRoot "Utils.psm1") -Force
-Import-Module (Join-Path $PSScriptRoot "Diagnostics.psm1") -Force
-
 $global:LastRestartTimestamp = $null
 $global:RestartHistory = @()
 
@@ -136,12 +133,16 @@ function Start-Watchdog {
 
     while ($true) {
 
+        # --- FIX: cycleStart BEFORE everything ---
         $cycleStart = Get-Date
 
+        # Run diagnostics
         $logFile = Invoke-Diagnostics -Config $Config
 
+        # AutoKill
         Apply-AutoKill -Config $Config -LogFile $logFile
 
+        # Load latest diagnostics JSON
         $exportFolder = Join-Path $PSScriptRoot "..\..\logs\export"
         $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" -ErrorAction SilentlyContinue |
                       Sort-Object Name -Descending | Select-Object -First 1
@@ -165,14 +166,15 @@ function Start-Watchdog {
 
             $now = Get-Date
 
+            # Quarantine check
             $inQuarantine = Check-Quarantine -Now $now -Config $Config
             if ($inQuarantine) {
                 Write-Log -File $logFile -Message "QUARANTINE ACTIVE: Skipping restart of LightingService."
                 $needRestart = $false
             }
 
+            # Cooldown check
             if ($needRestart) {
-
                 if ($global:LastRestartTimestamp -ne $null) {
                     $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
                     if ($elapsed -lt $Config.CooldownSeconds) {
@@ -180,33 +182,42 @@ function Start-Watchdog {
                         $needRestart = $false
                     }
                 }
+            }
 
-                if ($needRestart) {
-                    Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
+            # Restart logic
+            if ($needRestart) {
+                Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
 
-                    try {
-                        $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
-                        if ($proc) {
-                            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
-                        }
-
-                        Start-Sleep -Seconds 2
-                        Start-Service -Name LightingService -ErrorAction Stop
-
-                        Write-Log -File $logFile -Message "LightingService restarted successfully."
-                        $global:LastRestartTimestamp = Get-Date
-                        $lastRestart = $global:LastRestartTimestamp
-                        $global:RestartHistory += $lastRestart
-
-                        Write-RestartEvent -Reason $reason -Result $data -Config $Config
-
-                    } catch {
-                        Write-Log -File $logFile -Message "Failed to restart LightingService: $_"
+                try {
+                    $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
+                    if ($proc) {
+                        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
                     }
+
+                    Start-Sleep -Seconds 2
+                    Start-Service -Name LightingService -ErrorAction Stop
+
+                    Write-Log -File $logFile -Message "LightingService restarted successfully."
+                    $global:LastRestartTimestamp = Get-Date
+                    $lastRestart = $global:LastRestartTimestamp
+                    $global:RestartHistory += $lastRestart
+
+                    Write-RestartEvent -Reason $reason -Result $data -Config $Config
+
+                } catch {
+                    Write-Log -File $logFile -Message "Failed to restart LightingService: $_"
                 }
             }
         }
 
+        # Heartbeat update
+        $lastHeartbeat = Get-Date
+        Update-Heartbeat -LastHeartbeat $lastHeartbeat -LastRestart $lastRestart -WatchdogHealth $watchdogHealth -CycleTimeSeconds $Config.WatchdogIntervalSeconds
+
+        # Sleep for interval
+        Start-Sleep -Seconds $Config.WatchdogIntervalSeconds
+
+        # --- FIX: measure cycle AFTER sleep ---
         $cycleEnd = Get-Date
         $cycleDuration = ($cycleEnd - $cycleStart).TotalSeconds
         $drift = $cycleDuration - $Config.WatchdogIntervalSeconds
@@ -217,11 +228,6 @@ function Start-Watchdog {
         } else {
             $watchdogHealth = [math]::Min(100, $watchdogHealth + 1)
         }
-
-        $lastHeartbeat = Get-Date
-        Update-Heartbeat -LastHeartbeat $lastHeartbeat -LastRestart $lastRestart -WatchdogHealth $watchdogHealth -CycleTimeSeconds $Config.WatchdogIntervalSeconds
-
-        Start-Sleep -Seconds $Config.WatchdogIntervalSeconds
     }
 }
 

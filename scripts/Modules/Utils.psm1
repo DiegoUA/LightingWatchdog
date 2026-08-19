@@ -1,7 +1,18 @@
 function Get-Config {
     # config folder is two levels above Modules\
     $configPath = Join-Path $PSScriptRoot "..\..\config\config.json"
-    return Get-Content $configPath | ConvertFrom-Json
+
+    if (Test-Path $configPath) {
+        try {
+            return Get-Content $configPath -Raw | ConvertFrom-Json
+        } catch {
+            Write-Log "Failed to parse config.json: $_"
+            return $null
+        }
+    } else {
+        Write-Log "Config file not found at $configPath"
+        return $null
+    }
 }
 
 function Get-Timestamp {
@@ -20,9 +31,18 @@ function Get-Timestamp {
 
 function Write-Log {
     param(
-        [string]$File,
-        [string]$Message
+        [Parameter(Position = 0)]
+        [string]$Message,
+
+        [Parameter(Position = 1)]
+        [string]$File = "application.log"
     )
+
+    # If -File was called named or positionally, handle parameter swapping if needed
+    if ([string]::IsNullOrWhiteSpace($Message) -and -not [string]::IsNullOrWhiteSpace($File)) {
+        $Message = $File
+        $File = "application.log"
+    }
 
     # If caller passes a relative name, resolve it under ..\..\logs
     if (-not [System.IO.Path]::IsPathRooted($File)) {
@@ -38,12 +58,14 @@ function Write-Log {
     $Message | Out-File -FilePath $File -Append -Encoding UTF8
 }
 
+
 function Show-Alert {
     param(
         [string]$Message,
         [string]$Title,
         [bool]$EnablePopups
     )
+
     if ($EnablePopups) {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($Message, $Title)
@@ -65,8 +87,8 @@ function Send-WebhookNotification {
         $json = $Payload | ConvertTo-Json -Depth 4
         Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType "application/json"
     } catch {
-        # best-effort only
+        Write-Log "Webhook send failed: $_"
     }
 }
 
-Export-ModuleMember -Function Get-Config, Get-Timestamp, Write-Log, Show-Alert, Send-WebhookNotification
+Export-ModuleMember -Function Get-Config, Get-Timestamp, Send-WebhookNotification, Show-Alert, Write-Log
