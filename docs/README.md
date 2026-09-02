@@ -96,6 +96,12 @@ From v2.5+, the system includes:
 
 - Watchdog health scoring
 
+From v2.6+, the system includes:
+
+- Aggressive process tree termination (taskkill) for orphaned child processes.
+
+- Safe TCP TIME_WAIT kernel flush loops prior to service restoration.
+
 ---
 
 ## 🧩 Version History
@@ -120,6 +126,7 @@ From v2.5+, the system includes:
 | **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, ``$PSScriptRoot`` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
 | **v2.5.3** | 2026‑08‑19 | Unified ``Write-Log ``-File ``-Message``, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
 | **v2.5.4** | 2026‑08‑19 | Fixed watchdog cycle timing, stabilized module imports, corrected Write-Log path handling, improved continuous-mode reliability. |
+| **v2.6.0** | 2026‑09‑03 | Process tree termination (taskkill), TIME_WAIT socket flush cooldown loop, and pipeline type-safety fixes for logging module. |
 
 ## Key Features
 

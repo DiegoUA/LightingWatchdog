@@ -3,7 +3,17 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
-# Changelog
+
+## [2.6.0] - 2026-09-03
+### Added
+- Implemented process tree termination (`taskkill /F /T`) to aggressively shut down `LightingService` and any orphaned child processes (e.g., `AuraService`).
+- Added a strict 15-second TCP flush wait-loop to ensure the Windows kernel drops `TIME_WAIT` sockets before the service is allowed to restart.
+
+### Fixed
+- Resolved a critical pipeline leakage issue causing `Write-Log : Cannot process argument transformation on parameter 'File'` by enforcing strict type handling on the `$logFile` path.
+- Prevented false restarts by wrapping the aggressive shutdown sequence inside the proper Cooldown and Quarantine conditional blocks.
+
+---
 
 ## [2.5.4] - 2026-08-19
 ### Fixed
@@ -21,7 +31,7 @@ All notable changes to LightingWatchdog are documented here.
 ### Notes
 - Logging errors caused by invalid file paths (e.g., "OK") are now resolved.
 
-## v2.5.3 — 2026‑08‑19
+## [2.5.3] — 2026‑08‑19
 ### Stability & Path‑Safety Release
 
 This version delivers a full path‑safety refactor across all modules, eliminating
@@ -40,22 +50,19 @@ wrappers, and manual execution.
 - Hardened module imports using `Join-Path $PSScriptRoot`.
 
 ### Changed
-- Diagnostics, Watchdog, Trends, and Utils modules rewritten to remove all
-  relative paths.
+- Diagnostics, Watchdog, Trends, and Utils modules rewritten to remove all relative paths.
 - NetworkDiag.ps1 updated to use absolute module imports.
 - Restart event logging and heartbeat updates now use stable absolute paths.
 - Improved consistency of JSON and CSV export behavior.
 
 ### Fixed
-- `DriveNotFoundException` caused by relative paths resolving incorrectly when
-  the working directory contained prefixes like `OK`.
+- `DriveNotFoundException` caused by relative paths resolving incorrectly when the working directory contained prefixes like `OK`.
 - CSV append issues under certain execution contexts.
 - Watchdog drift detection occasionally reporting incorrect cycle durations.
 - Webhook payload inconsistencies for restart events.
 
 ### Notes
-No configuration changes required. Existing `config.json` remains fully
-compatible.
+No configuration changes required. Existing `config.json` remains fully compatible.
 
 ## [2.5.2] - 2026-08-19
 ### Fixed

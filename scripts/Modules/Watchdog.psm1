@@ -136,8 +136,19 @@ function Start-Watchdog {
         # --- FIX: cycleStart BEFORE everything ---
         $cycleStart = Get-Date
 
-        # Run diagnostics
-        $logFile = Invoke-Diagnostics -Config $Config
+        # Run diagnostics and capture all output
+        $diagOutput = Invoke-Diagnostics -Config $Config
+
+        # Filter out pipeline leakage to isolate the actual log file path
+        if ($diagOutput -is [array]) {
+            # Grab the last string that looks like a file path
+            $logFile = ($diagOutput | Where-Object { $_ -is [string] -and $_ -match '\.log$' })[-1]
+        } elseif ($diagOutput -is [string]) {
+            $logFile = $diagOutput
+        }
+
+        # Failsafe cast to ensure Write-Log receives a strict string
+        $logFile = [string]$logFile
 
         # AutoKill
         Apply-AutoKill -Config $Config -LogFile $logFile
@@ -153,6 +164,7 @@ function Start-Watchdog {
             $needRestart = $false
             $reason = $null
 
+            # Restore the condition checks to set the flags
             if ($data.LightingLeakDetected) {
                 $needRestart = $true
                 $reason = "LightingLeak"
@@ -184,17 +196,35 @@ function Start-Watchdog {
                 }
             }
 
-            # Restart logic
+            # Restart logic containing the aggressive shutdown and TCP flush
             if ($needRestart) {
                 Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
 
                 try {
-                    $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
-                    if ($proc) {
-                        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                    Write-Log -File $logFile -Message "LEAK DETECTED: Initiating aggressive shutdown of LightingService..."
+                    
+                    # 1. Attempt graceful stop first
+                    Stop-Service -Name LightingService -Force -PassThru -ErrorAction SilentlyContinue | Out-Null
+                    
+                    # 2. Kill the process tree (LightingService + orphaned children holding sockets)
+                    $rogueProcesses = Get-Process -Name LightingService, AuraService -ErrorAction SilentlyContinue
+                    if ($rogueProcesses) {
+                        foreach ($proc in $rogueProcesses) {
+                            Write-Log -File $logFile -Message "Force killing process tree for PID $($proc.Id)..."
+                            taskkill /F /T /PID $proc.Id 2>&1 | Out-Null 
+                        }
                     }
 
-                    Start-Sleep -Seconds 2
+                    # 3. The TCP Flush Cooldown Loop
+                    Write-Log -File $logFile -Message "Waiting for Windows kernel to flush TIME_WAIT sockets..."
+                    $flushWaitSeconds = 15
+                    while ($flushWaitSeconds -gt 0) {
+                        Start-Sleep -Seconds 1
+                        $flushWaitSeconds--
+                    }
+
+                    # 4. Safe Restart
+                    Write-Log -File $logFile -Message "TCP sockets flushed. Restarting LightingService..."
                     Start-Service -Name LightingService -ErrorAction Stop
 
                     Write-Log -File $logFile -Message "LightingService restarted successfully."
