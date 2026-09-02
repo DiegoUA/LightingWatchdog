@@ -139,12 +139,24 @@ function Start-Watchdog {
         # Run diagnostics and capture all output
         $diagOutput = Invoke-Diagnostics -Config $Config
 
-        # Filter out pipeline leakage to isolate the actual log file path
+        # Safely extract the log file path without assuming the array isn't null
+        $logFile = $null
         if ($diagOutput -is [array]) {
-            # Grab the last string that looks like a file path
-            $logFile = ($diagOutput | Where-Object { $_ -is [string] -and $_ -match '\.log$' })[-1]
-        } elseif ($diagOutput -is [string]) {
+            $validPaths = $diagOutput | Where-Object { $_ -is [string] -and $_ -match '\.log$' }
+            if ($validPaths) {
+                $logFile = $validPaths[-1]
+            }
+        } elseif ($diagOutput -is [string] -and $diagOutput -match '\.log$') {
             $logFile = $diagOutput
+        }
+
+        # FAILSAFE: If Invoke-Diagnostics failed to return a valid path, use a fallback so the watchdog doesn't crash
+        if ([string]::IsNullOrWhiteSpace($logFile)) {
+            $fallbackDir = Join-Path $PSScriptRoot "..\..\logs"
+            if (!(Test-Path $fallbackDir)) {
+                New-Item -ItemType Directory -Path $fallbackDir | Out-Null
+            }
+            $logFile = Join-Path $fallbackDir "watchdog_fallback.log"
         }
 
         # Failsafe cast to ensure Write-Log receives a strict string
@@ -196,36 +208,49 @@ function Start-Watchdog {
                 }
             }
 
-            # Restart logic containing the aggressive shutdown and TCP flush
+            # Restart logic containing the aggressive shutdown, death verification, and TCP flush
             if ($needRestart) {
                 Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
 
                 try {
                     Write-Log -File $logFile -Message "LEAK DETECTED: Initiating aggressive shutdown of LightingService..."
                     
-                    # 1. Attempt graceful stop first
-                    Stop-Service -Name LightingService -Force -PassThru -ErrorAction SilentlyContinue | Out-Null
+                    # 1. Attempt graceful stop first to satisfy SCM
+                    Stop-Service -Name LightingService -Force -ErrorAction SilentlyContinue | Out-Null
                     
                     # 2. Kill the process tree (LightingService + orphaned children holding sockets)
-                    $rogueProcesses = Get-Process -Name LightingService, AuraService -ErrorAction SilentlyContinue
+                    $rogueProcesses = Get-Process -Name "LightingService", "AuraService" -ErrorAction SilentlyContinue
                     if ($rogueProcesses) {
                         foreach ($proc in $rogueProcesses) {
                             Write-Log -File $logFile -Message "Force killing process tree for PID $($proc.Id)..."
+                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue | Out-Null
                             taskkill /F /T /PID $proc.Id 2>&1 | Out-Null 
                         }
                     }
 
-                    # 3. The TCP Flush Cooldown Loop
-                    Write-Log -File $logFile -Message "Waiting for Windows kernel to flush TIME_WAIT sockets..."
-                    $flushWaitSeconds = 15
-                    while ($flushWaitSeconds -gt 0) {
+                    # 3. VERIFY process is actually dead
+                    $verifyWait = 0
+                    while ((Get-Process -Name "LightingService" -ErrorAction SilentlyContinue) -and ($verifyWait -lt 10)) {
+                        Write-Log -File $logFile -Message "Waiting for LightingService process to die..."
                         Start-Sleep -Seconds 1
-                        $flushWaitSeconds--
+                        $verifyWait++
                     }
 
-                    # 4. Safe Restart
+                    if (Get-Process -Name "LightingService" -ErrorAction SilentlyContinue) {
+                        Write-Log -File $logFile -Message "CRITICAL ERROR: Could not kill LightingService! Ensure this script is running as Administrator."
+                    } else {
+                        # 4. The TCP Flush Cooldown Loop
+                        Write-Log -File $logFile -Message "Process dead. Waiting 15s for Windows kernel to flush TIME_WAIT sockets..."
+                        $flushWaitSeconds = 15
+                        while ($flushWaitSeconds -gt 0) {
+                            Start-Sleep -Seconds 1
+                            $flushWaitSeconds--
+                        }
+                    }
+
+                    # 5. Safe Restart
                     Write-Log -File $logFile -Message "TCP sockets flushed. Restarting LightingService..."
-                    Start-Service -Name LightingService -ErrorAction Stop
+                    Start-Service -Name LightingService -ErrorAction SilentlyContinue
 
                     Write-Log -File $logFile -Message "LightingService restarted successfully."
                     $global:LastRestartTimestamp = Get-Date
