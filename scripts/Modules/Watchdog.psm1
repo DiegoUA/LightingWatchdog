@@ -73,7 +73,7 @@ function Update-Heartbeat {
     $obj | ConvertTo-Json -Depth 4 | Out-File $heartbeatPath -Encoding UTF8
 }
 
-function Check-Quarantine {
+function Test-Quarantine {
     param(
         [datetime]$Now,
         $Config
@@ -93,7 +93,7 @@ function Check-Quarantine {
     return $false
 }
 
-function Apply-AutoKill {
+function Invoke-AutoKill {
     param(
         $Config,
         [string]$LogFile
@@ -151,7 +151,7 @@ function Start-Watchdog {
         $logFile = [string]$logFile
 
         # AutoKill
-        Apply-AutoKill -Config $Config -LogFile $logFile
+        Invoke-AutoKill -Config $Config -LogFile $logFile
 
         # Load latest diagnostics JSON
         $exportFolder = Join-Path $PSScriptRoot "..\..\logs\export"
@@ -179,7 +179,7 @@ function Start-Watchdog {
             $now = Get-Date
 
             # Quarantine check
-            $inQuarantine = Check-Quarantine -Now $now -Config $Config
+            $inQuarantine = Test-Quarantine -Now $now -Config $Config
             if ($inQuarantine) {
                 Write-Log -File $logFile -Message "QUARANTINE ACTIVE: Skipping restart of LightingService."
                 $needRestart = $false
@@ -187,7 +187,7 @@ function Start-Watchdog {
 
             # Cooldown check
             if ($needRestart) {
-                if ($global:LastRestartTimestamp -ne $null) {
+                if ($null -ne $global:LastRestartTimestamp) {
                     $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
                     if ($elapsed -lt $Config.CooldownSeconds) {
                         Write-Log -File $logFile -Message "Cooldown active ($elapsed s < $($Config.CooldownSeconds) s). Skipping restart."
