@@ -3,6 +3,17 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [2.7.0] - 2026-09-06
+### Added
+- Abstracted hardcoded `LightingService` references into a dynamic `MonitoredServices` array in `config.json`.
+- Transformed the script into a universal watchdog capable of policing multiple independent process trees simultaneously.
+- Updated `Invoke-Diagnostics` to generate a dynamic `ServiceStates` array instead of flat service properties.
+- Rewrote the watchdog restart logic to dynamically target the failing service from the new array structure.
+
+## [2.6.1] - 2026-09-05
+### Changed
+- Removed all GUI popups (`System.Windows.Forms` and `Wscript.Shell`) to prevent AFK thread freezing.
+- Routed all alerts exclusively to the PowerShell console (`Write-Host`) and `.log` files for fully autonomous, headless operation.
 
 ## [2.6.0] - 2026-09-03
 ### Added

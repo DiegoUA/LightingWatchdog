@@ -4,6 +4,8 @@ $global:RestartHistory = @()
 function Write-RestartEvent {
     param(
         [string]$Reason,
+        [string]$ServiceName,
+        [int]$CurrentConns,
         $Result,
         $Config
     )
@@ -16,15 +18,13 @@ function Write-RestartEvent {
     $restartCsvPath = Join-Path $exportFolder "RestartEvents.csv"
 
     $row = New-Object PSObject -Property @{
-        Timestamp            = $Result.Timestamp
-        Reason               = $Reason
-        HealthScore          = $Result.HealthScore
-        TcpTotal             = $Result.TcpTotal
-        LightingServiceConns = $Result.LightingServiceConns
-        NonPagedPercent      = $Result.NonPagedPercent
-        TcpNewPerSec         = $Result.TcpNewPerSec
-        UdpNewPerSec         = $Result.UdpNewPerSec
-        LeakGrowthRate       = $Result.LeakGrowthRate
+        Timestamp       = $Result.Timestamp
+        Reason          = $Reason
+        ServiceName     = $ServiceName
+        ServiceConns    = $CurrentConns
+        HealthScore     = $Result.HealthScore
+        NonPagedPercent = $Result.NonPagedPercent
+        LeakGrowthRate  = $Result.LeakGrowthRate
     }
 
     if (!(Test-Path $restartCsvPath)) {
@@ -35,14 +35,12 @@ function Write-RestartEvent {
 
     if ($Config.EnableWebhooks -and $Result.HealthScore -lt $Config.WebhookMinHealthScore) {
         $payload = @{
-            Timestamp       = $Result.Timestamp
-            Event           = "LightingServiceRestart"
-            Reason          = $Reason
-            HealthScore     = $Result.HealthScore
-            TcpTotal        = $Result.TcpTotal
-            LightingConns   = $Result.LightingServiceConns
-            NonPagedPercent = $Result.NonPagedPercent
-            LeakGrowthRate  = $Result.LeakGrowthRate
+            Timestamp   = $Result.Timestamp
+            Event       = "ServiceRestart"
+            Reason      = $Reason
+            Target      = $ServiceName
+            Connections = $CurrentConns
+            HealthScore = $Result.HealthScore
         }
         Send-WebhookNotification -WebhookUrl $Config.WebhookUrl -Payload $payload -EnableWebhooks $Config.EnableWebhooks
     }
@@ -79,9 +77,7 @@ function Test-Quarantine {
         $Config
     )
 
-    if (-not $Config.EnableQuarantine) {
-        return $false
-    }
+    if (-not $Config.EnableQuarantine) { return $false }
 
     $windowStart = $Now.AddMinutes(-$Config.QuarantineWindowMinutes)
     $global:RestartHistory = $global:RestartHistory | Where-Object { $_ -ge $windowStart }
@@ -99,31 +95,23 @@ function Invoke-AutoKill {
         [string]$LogFile
     )
 
-    if (-not $Config.EnableAutoKill) {
-        return
-    }
+    if (-not $Config.EnableAutoKill) { return }
 
     foreach ($name in $Config.AutoKillProcesses) {
         $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($proc) {
             $memMB = [math]::Round($proc.WorkingSet64 / 1MB, 2)
-
             if ($memMB -gt $Config.AutoKillMemThresholdMB) {
                 Write-Log -File $LogFile -Message "AUTO-KILL: $name using $memMB MB. Terminating."
-                try {
-                    Stop-Process -Id $proc.Id -Force -ErrorAction Stop
-                } catch {
-                    Write-Log -File $LogFile -Message "AUTO-KILL FAILED: $name - $_"
-                }
+                try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } 
+                catch { Write-Log -File $LogFile -Message "AUTO-KILL FAILED: $name - $_" }
             }
         }
     }
 }
 
 function Start-Watchdog {
-    param(
-        $Config
-    )
+    param($Config)
 
     Write-Host "Watchdog started in continuous mode. Running autonomously..." -ForegroundColor Cyan
 
@@ -137,7 +125,7 @@ function Start-Watchdog {
         # Run diagnostics
         $diagOutput = Invoke-Diagnostics -Config $Config
 
-        # Extract log file
+        # Safe Log File Extraction
         $logFile = $null
         if ($diagOutput -is [array]) {
             $validPaths = $diagOutput | Where-Object { $_ -is [string] -and $_ -match '\.log$' }
@@ -146,7 +134,6 @@ function Start-Watchdog {
             $logFile = $diagOutput
         }
 
-        # Fallback log
         if ([string]::IsNullOrWhiteSpace($logFile)) {
             $fallbackDir = Join-Path $PSScriptRoot "..\..\logs"
             if (!(Test-Path $fallbackDir)) { New-Item -ItemType Directory -Path $fallbackDir | Out-Null }
@@ -156,115 +143,105 @@ function Start-Watchdog {
 
         Invoke-AutoKill -Config $Config -LogFile $logFile
 
-        # Load latest diagnostics JSON
+        # Load Diagnostics JSON
         $exportFolder = Join-Path $PSScriptRoot "..\..\logs\export"
         $latestJson = Get-ChildItem $exportFolder -Filter "diag_*.json" -ErrorAction SilentlyContinue |
                       Sort-Object Name -Descending | Select-Object -First 1
 
         if ($latestJson) {
             $data = Get-Content $latestJson.FullName | ConvertFrom-Json
-
-            # Live Console Feedback for the cycle
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Scan complete. LightingService TCP: $($data.LightingServiceConns)" -ForegroundColor DarkGray
-
-            $needRestart = $false
-            $reason = $null
-
-            if ($data.LightingLeakDetected) {
-                $needRestart = $true
-                $reason = "LightingLeak"
-            } elseif ($data.NonPagedPressure) {
-                $needRestart = $true
-                $reason = "KernelPressure"
-            } elseif ($data.StormDetected) {
-                $needRestart = $true
-                $reason = "Storm"
-            }
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Scan complete." -ForegroundColor DarkGray
 
             $now = Get-Date
 
-            # Quarantine check
-            $inQuarantine = Test-Quarantine -Now $now -Config $Config
-            if ($inQuarantine -and $needRestart) {
-                Write-Log -File $logFile -Message "QUARANTINE ACTIVE: Skipping restart of LightingService."
-                Write-Host "--> RESTART BLOCKED: Quarantine is active." -ForegroundColor DarkRed
-                $needRestart = $false
-            }
-
-            # Cooldown check
-            if ($needRestart) {
-                if ($null -ne $global:LastRestartTimestamp) {
-                    $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
-                    if ($elapsed -lt $Config.CooldownSeconds) {
-                        Write-Log -File $logFile -Message "Cooldown active ($elapsed s < $($Config.CooldownSeconds) s). Skipping restart."
-                        Write-Host "--> RESTART BLOCKED: Cooldown active ($elapsed sec)." -ForegroundColor DarkYellow
-                        $needRestart = $false
-                    }
-                }
-            }
-
-            # Restart logic containing aggressive shutdown, console feedback, and re-evaluation
-            if ($needRestart) {
-                Write-Host ""
-                Write-Host ">>> LEAK DETECTED: LightingService currently has $($data.LightingServiceConns) connections. <<<" -ForegroundColor Red
-                Write-Log -File $logFile -Message "Restarting LightingService due to $reason."
-
-                try {
-                    Write-Host "Attempting to stop LightingService..." -ForegroundColor Yellow
-                    Stop-Service -Name LightingService -Force -ErrorAction SilentlyContinue | Out-Null
+            # Evaluate each monitored service dynamically
+            if ($data.ServiceStates) {
+                foreach ($service in $data.ServiceStates) {
+                    Write-Host " -> $($service.ServiceName): $($service.CurrentConnections) connections" -ForegroundColor DarkGray
                     
-                    $rogueProcesses = Get-Process -Name "LightingService", "AuraService" -ErrorAction SilentlyContinue
-                    if ($rogueProcesses) {
-                        foreach ($proc in $rogueProcesses) {
-                            Write-Host "Force killing process tree for PID $($proc.Id)..." -ForegroundColor DarkYellow
-                            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue | Out-Null
-                            taskkill /F /T /PID $proc.Id 2>&1 | Out-Null 
+                    if ($service.LeakDetected -and $service.EnableRestart) {
+                        
+                        $inQuarantine = Test-Quarantine -Now $now -Config $Config
+                        if ($inQuarantine) {
+                            Write-Log -File $logFile -Message "QUARANTINE ACTIVE: Skipping restart for $($service.ServiceName)."
+                            Write-Host "--> RESTART BLOCKED: Quarantine is active." -ForegroundColor DarkRed
+                            continue
                         }
-                    }
 
-                    $verifyWait = 0
-                    while ((Get-Process -Name "LightingService" -ErrorAction SilentlyContinue) -and ($verifyWait -lt 10)) {
-                        Start-Sleep -Seconds 1
-                        $verifyWait++
-                    }
-
-                    if (Get-Process -Name "LightingService" -ErrorAction SilentlyContinue) {
-                        Write-Host "CRITICAL ERROR: Could not kill LightingService! Ensure script is running as Administrator." -ForegroundColor Red
-                    } else {
-                        Write-Host "Service stopped. Waiting 15 seconds for Windows kernel to flush TCP sockets..." -ForegroundColor Yellow
-                        $flushWaitSeconds = 15
-                        while ($flushWaitSeconds -gt 0) {
-                            Write-Host -NoNewline "."
-                            Start-Sleep -Seconds 1
-                            $flushWaitSeconds--
+                        if ($null -ne $global:LastRestartTimestamp) {
+                            $elapsed = ($now - $global:LastRestartTimestamp).TotalSeconds
+                            if ($elapsed -lt $Config.CooldownSeconds) {
+                                Write-Log -File $logFile -Message "Cooldown active ($elapsed s). Skipping restart for $($service.ServiceName)."
+                                Write-Host "--> RESTART BLOCKED: Cooldown active ($([math]::Round($elapsed)) sec)." -ForegroundColor DarkYellow
+                                continue
+                            }
                         }
+
+                        # Dynamic Aggressive Restart Logic
                         Write-Host ""
+                        Write-Host ">>> LEAK DETECTED: $($service.ServiceName) has $($service.CurrentConnections) connections. <<<" -ForegroundColor Red
+                        Write-Log -File $logFile -Message "Restarting $($service.ServiceName) due to TCP Leak."
+
+                        try {
+                            Write-Host "Attempting graceful stop of $($service.ServiceName)..." -ForegroundColor Yellow
+                            Stop-Service -Name $service.ServiceName -Force -ErrorAction SilentlyContinue | Out-Null
+                            
+                            $rogueProcesses = Get-Process -Name $service.ProcessTree -ErrorAction SilentlyContinue
+                            if ($rogueProcesses) {
+                                foreach ($proc in $rogueProcesses) {
+                                    Write-Host "Force killing process tree for PID $($proc.Id) ($($proc.Name))..." -ForegroundColor DarkYellow
+                                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue | Out-Null
+                                    taskkill /F /T /PID $proc.Id 2>&1 | Out-Null 
+                                }
+                            }
+
+                            $verifyWait = 0
+                            while ((Get-Process -Name $service.ProcessTree -ErrorAction SilentlyContinue) -and ($verifyWait -lt 10)) {
+                                Start-Sleep -Seconds 1
+                                $verifyWait++
+                            }
+
+                            if (Get-Process -Name $service.ProcessTree -ErrorAction SilentlyContinue) {
+                                Write-Host "CRITICAL ERROR: Could not kill $($service.ServiceName)! Run as Administrator." -ForegroundColor Red
+                            } else {
+                                Write-Host "Process dead. Waiting 15s for Windows kernel to flush sockets..." -ForegroundColor Yellow
+                                $flushWaitSeconds = 15
+                                while ($flushWaitSeconds -gt 0) {
+                                    Write-Host -NoNewline "."
+                                    Start-Sleep -Seconds 1
+                                    $flushWaitSeconds--
+                                }
+                                Write-Host ""
+                            }
+
+                            Write-Host "Sockets flushed. Restarting $($service.ServiceName)..." -ForegroundColor Cyan
+                            Start-Service -Name $service.ServiceName -ErrorAction SilentlyContinue
+                            
+                            Start-Sleep -Seconds 3
+                            $newConns = 0
+                            $newProc = Get-Process -Name $service.ProcessTree -ErrorAction SilentlyContinue
+                            if ($newProc) {
+                                foreach ($p in $newProc) {
+                                    $conns = Get-NetTCPConnection -OwningProcess $p.Id -ErrorAction SilentlyContinue
+                                    if ($conns) { $newConns += $conns.Count }
+                                }
+                            }
+                            
+                            Write-Host "Service restarted. Current connections: $newConns" -ForegroundColor Green
+                            Write-Host ""
+
+                            Write-Log -File $logFile -Message "$($service.ServiceName) restored. Connections: $newConns"
+                            $global:LastRestartTimestamp = Get-Date
+                            $lastRestart = $global:LastRestartTimestamp
+                            $global:RestartHistory += $lastRestart
+
+                            Write-RestartEvent -Reason "$($service.ServiceName) Leak" -ServiceName $service.ServiceName -CurrentConns $newConns -Result $data -Config $Config
+
+                        } catch {
+                            Write-Host "ERROR: Failed to restart $($service.ServiceName): $_" -ForegroundColor Red
+                            Write-Log -File $logFile -Message "Failed to restart $($service.ServiceName): $_"
+                        }
                     }
-
-                    Write-Host "TCP sockets flushed. Restarting service..." -ForegroundColor Cyan
-                    Start-Service -Name LightingService -ErrorAction SilentlyContinue
-                    
-                    # Wait for service to boot and re-evaluate connections
-                    Start-Sleep -Seconds 3
-                    $newProc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
-                    $newConns = 0
-                    if ($newProc) {
-                        $newConns = (Get-NetTCPConnection -OwningProcess $newProc.Id -ErrorAction SilentlyContinue | Measure-Object).Count
-                    }
-                    
-                    Write-Host "Service restarted. Re-evaluation complete. Current connections: $newConns" -ForegroundColor Green
-                    Write-Host ""
-
-                    Write-Log -File $logFile -Message "LightingService restarted successfully. New connection count: $newConns"
-                    $global:LastRestartTimestamp = Get-Date
-                    $lastRestart = $global:LastRestartTimestamp
-                    $global:RestartHistory += $lastRestart
-
-                    Write-RestartEvent -Reason $reason -Result $data -Config $Config
-
-                } catch {
-                    Write-Host "ERROR: Failed to restart LightingService: $_" -ForegroundColor Red
-                    Write-Log -File $logFile -Message "Failed to restart LightingService: $_"
                 }
             }
         }

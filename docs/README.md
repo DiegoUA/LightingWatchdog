@@ -102,6 +102,10 @@ From v2.6+, the system includes:
 
 - Safe TCP TIME_WAIT kernel flush loops prior to service restoration.
 
+From v2.7+, the system adds:
+- Dynamic multi-service monitoring via `config.json` arrays
+- Fully autonomous headless console execution (no GUI interruptions)
+
 ---
 
 ## 🧩 Version History
@@ -127,10 +131,11 @@ From v2.6+, the system includes:
 | **v2.5.3** | 2026‑08‑19 | Unified ``Write-Log ``-File ``-Message``, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
 | **v2.5.4** | 2026‑08‑19 | Fixed watchdog cycle timing, stabilized module imports, corrected Write-Log path handling, improved continuous-mode reliability. |
 | **v2.6.0** | 2026‑09‑03 | Process tree termination (taskkill), TIME_WAIT socket flush cooldown loop, and pipeline type-safety fixes for logging module. |
-
+| **v2.6.1** | 2026‑09‑05 | Removed GUI popups for fully autonomous headless operation. |
+| **v2.7.0** | 2026‑09‑06 | Abstracted configuration to support dynamic multi-service monitoring arrays. |
 ## Key Features
 
-- Leak detection and restart with cooldown
+- Leak detection and restart with cooldown for any configured service
 - Kernel nonpaged pool monitoring
 - WebSocket storm detection
 - Health scoring and trend analysis
@@ -140,10 +145,11 @@ From v2.6+, the system includes:
 - Optional UTC mode
 - Watchdog heartbeat (`logs/heartbeat.json`)
 - Clock drift detection
-- Quarantine mode for LightingService
+- Quarantine mode for all monitored services
 - Auto-kill for runaway processes
 - JSON + CSV exports
 - Optional webhook notifications
+- Headless autonomous console execution
 
 ---
 

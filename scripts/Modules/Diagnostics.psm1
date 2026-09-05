@@ -4,7 +4,15 @@ function Measure-HealthScore {
     $score = 100
     $w = $Config.Weights
 
-    if ($Result.LightingLeakDetected) { $score -= $w.LightingLeak }
+    # Check if ANY monitored service is currently leaking
+    $isLeaking = $false
+    if ($Result.ServiceStates) {
+        foreach ($s in $Result.ServiceStates) {
+            if ($s.LeakDetected) { $isLeaking = $true }
+        }
+    }
+
+    if ($isLeaking) { $score -= $w.ServiceLeak }
     if ($Result.NonPagedPressure)     { $score -= $w.NonPagedPressure }
     if ($Result.StormDetected)        { $score -= $w.Storm }
     if ($Result.TcpTotal -gt $Config.LeakThreshold) { $score -= $w.TcpLoad }
@@ -29,7 +37,7 @@ function Get-LeakGrowthRate {
         $lastTime  = [datetime]::Parse($last.Timestamp)
     } catch { return 0 }
 
-    $deltaConns = [double]$last.LightingServiceConns - [double]$first.LightingServiceConns
+    $deltaConns = [double]$last.MonitoredConnsSum - [double]$first.MonitoredConnsSum
     $deltaSeconds = ($lastTime - $firstTime).TotalSeconds
 
     if ($deltaSeconds -le 0) { return 0 }
@@ -56,50 +64,64 @@ function Invoke-Diagnostics {
 
     # --- Result object ---
     $result = [ordered]@{
-        Timestamp              = $timestamp
-        TcpTotal               = $null
-        LightingServicePid     = $null
-        LightingServiceConns   = $null
-        LightingLeakDetected   = $false
-        NonPagedPercent        = $null
-        NonPagedPressure       = $false
-        TcpNewPerSec           = $null
-        UdpNewPerSec           = $null
-        StormDetected          = $false
-        HealthScore            = $null
-        RollingAverage         = $null
-        RollingStdDev          = $null
-        ZScore                 = $null
-        TrendDirection         = $null
-        LeakGrowthRate         = $null
-        NonPagedTrend          = $null
+        Timestamp          = $timestamp
+        TcpTotal           = $null
+        ServiceStates      = @()
+        MonitoredConnsSum  = 0
+        NonPagedPercent    = $null
+        NonPagedPressure   = $false
+        TcpNewPerSec       = $null
+        UdpNewPerSec       = $null
+        StormDetected      = $false
+        HealthScore        = $null
+        RollingAverage     = $null
+        RollingStdDev      = $null
+        ZScore             = $null
+        TrendDirection     = $null
+        LeakGrowthRate     = $null
+        NonPagedTrend      = $null
     }
 
     # --- TCP count ---
-    $tcpTotal = (Get-NetTCPConnection).Count
+    $tcpTotal = (Get-NetTCPConnection -ErrorAction SilentlyContinue | Measure-Object).Count
     $result.TcpTotal = $tcpTotal
     Write-Log -File $logFile -Message "TCP connections: $tcpTotal"
 
-    # --- LightingService leak detection ---
-    $proc = Get-Process -Name LightingService -ErrorAction SilentlyContinue
-    if ($proc) {
-        $pid   = $proc.Id
-        $conns = (Get-NetTCPConnection | Where-Object { $_.OwningProcess -eq $pid }).Count
+    # --- Abstracted Service Leak Detection ---
+    $serviceStates = @()
+    $totalMonitoredConns = 0
 
-        $result.LightingServicePid   = $pid
-        $result.LightingServiceConns = $conns
-
-        Write-Log -File $logFile -Message "LightingService PID: $pid"
-        Write-Log -File $logFile -Message "LightingService connections: $conns"
-
-        if ($conns -gt $Config.LeakThreshold) {
-            $result.LightingLeakDetected = $true
-            Show-Alert "LightingService leak detected ($conns connections)" "LightingWatchdog" $Config.EnablePopups
-            Write-Log -File $logFile -Message "LEAK DETECTED"
+    foreach ($target in $Config.MonitoredServices) {
+        $connCount = 0
+        $procs = Get-Process -Name $target.ProcessTree -ErrorAction SilentlyContinue
+        if ($procs) {
+            foreach ($p in $procs) {
+                $conns = Get-NetTCPConnection -OwningProcess $p.Id -ErrorAction SilentlyContinue
+                if ($conns) { $connCount += $conns.Count }
+            }
         }
-    } else {
-        Write-Log -File $logFile -Message "LightingService not running."
+        
+        $isLeaking = ($connCount -gt $target.MaxTcpConnections)
+        $totalMonitoredConns += $connCount
+
+        Write-Log -File $logFile -Message "$($target.ServiceName) connections: $connCount"
+        
+        if ($isLeaking) {
+            Write-Log -File $logFile -Message "LEAK DETECTED in $($target.ServiceName)"
+            Show-Alert "$($target.ServiceName) leak detected ($connCount conns)" "Watchdog" $Config.EnablePopups
+        }
+
+        $serviceStates += @{
+            ServiceName        = $target.ServiceName
+            ProcessTree        = $target.ProcessTree
+            CurrentConnections = $connCount
+            LeakDetected       = $isLeaking
+            EnableRestart      = $target.EnableRestart
+        }
     }
+
+    $result.ServiceStates = $serviceStates
+    $result.MonitoredConnsSum = $totalMonitoredConns
 
     # --- Nonpaged pool ---
     $os    = Get-CimInstance Win32_OperatingSystem
@@ -122,13 +144,13 @@ function Invoke-Diagnostics {
     }
 
     # --- WebSocket storm ---
-    $tcp1 = (Get-NetTCPConnection).Count
-    $udp1 = (Get-NetUDPEndpoint).Count
+    $tcp1 = (Get-NetTCPConnection -ErrorAction SilentlyContinue | Measure-Object).Count
+    $udp1 = (Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Measure-Object).Count
 
     Start-Sleep -Seconds 1
 
-    $tcp2 = (Get-NetTCPConnection).Count
-    $udp2 = (Get-NetUDPEndpoint).Count
+    $tcp2 = (Get-NetTCPConnection -ErrorAction SilentlyContinue | Measure-Object).Count
+    $udp2 = (Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Measure-Object).Count
 
     $result.TcpNewPerSec = $tcp2 - $tcp1
     $result.UdpNewPerSec = $udp2 - $udp1
@@ -167,7 +189,7 @@ function Invoke-Diagnostics {
     Write-Log -File $logFile -Message "Leak growth rate: $($result.LeakGrowthRate) connections/sec"
 
     # --- Nonpaged trend ---
-    if ($trendData -ne $null -and $trendData.Count -ge 3) {
+    if ($null -ne $trendData -and $trendData.Count -ge 3) {
         $npValues = $trendData.NonPagedPercent | ForEach-Object { [double]$_ }
         $npAvg = ($npValues | Measure-Object -Average).Average
         $npDelta = $result.NonPagedPercent - $npAvg
@@ -202,7 +224,18 @@ function Invoke-Diagnostics {
 
     # --- CSV export ---
     if ($Config.EnableCsvExport) {
-        $obj = New-Object PSObject -Property $result
+        # Create a simplified object for the CSV to avoid complex nested arrays
+        $csvResult = [ordered]@{
+            Timestamp         = $result.Timestamp
+            TcpTotal          = $result.TcpTotal
+            MonitoredConnsSum = $result.MonitoredConnsSum
+            NonPagedPercent   = $result.NonPagedPercent
+            TcpNewPerSec      = $result.TcpNewPerSec
+            UdpNewPerSec      = $result.UdpNewPerSec
+            HealthScore       = $result.HealthScore
+            LeakGrowthRate    = $result.LeakGrowthRate
+        }
+        $obj = New-Object PSObject -Property $csvResult
 
         if (!(Test-Path $diagnosticsCsvPath)) {
             $obj | Export-Csv -Path $diagnosticsCsvPath -NoTypeInformation
@@ -232,4 +265,4 @@ function Invoke-Diagnostics {
     return $logFile
 }
 
-Export-ModuleMember -Function Get-LeakGrowthRate, Invoke-Diagnostics, Measure-HealthScore   
+Export-ModuleMember -Function Get-LeakGrowthRate, Invoke-Diagnostics, Measure-HealthScore

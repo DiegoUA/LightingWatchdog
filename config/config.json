@@ -26,15 +26,24 @@
     "QuarantineDurationMinutes": 30,
 
     "EnableAutoKill": true,
-    "AutoKillProcesses": [ "LightingService" ],
+    "AutoKillProcesses": [ "ArmouryWebBrowserEdge", "GameVisual" ],
     "AutoKillCpuThreshold": 80,
     "AutoKillMemThresholdMB": 500,
 
     "Weights": {
-        "LightingLeak": 40,
+        "ServiceLeak": 40,
         "NonPagedPressure": 25,
         "Storm": 20,
         "TcpLoad": 10,
         "UdpLoad": 5
-    }
+    },
+    
+    "MonitoredServices": [
+        {
+            "ServiceName": "LightingService",
+            "ProcessTree": ["LightingService", "AuraService"],
+            "MaxTcpConnections": 150,
+            "EnableRestart": true
+        }
+    ]
 }
