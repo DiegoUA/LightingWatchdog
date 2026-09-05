@@ -62,13 +62,17 @@ function Write-Log {
 function Show-Alert {
     param(
         [string]$Message,
-        [string]$Title,
-        [bool]$EnablePopups
+        [string]$Title = "Watchdog Alert",
+        [bool]$EnablePopups = $false, # Kept for backward compatibility, completely ignored
+        [string]$LogFile = $null
     )
 
-    if ($EnablePopups) {
-        Add-Type -AssemblyName System.Windows.Forms
-        [System.Windows.Forms.MessageBox]::Show($Message, $Title)
+    # 1. Always output to the PowerShell console
+    Write-Host ">>> [$Title] $Message <<<" -ForegroundColor Magenta
+
+    # 2. Write to the log file if a path is provided
+    if (![string]::IsNullOrWhiteSpace($LogFile)) {
+        Write-Log -File $LogFile -Message "[$Title] $Message"
     }
 }
 

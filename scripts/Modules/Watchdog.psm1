@@ -125,8 +125,7 @@ function Start-Watchdog {
         $Config
     )
 
-    Show-Alert "LightingWatchdog started in continuous mode." "Watchdog" $Config.EnablePopups
-    Write-Host "LightingWatchdog started in continuous mode. Monitoring..." -ForegroundColor Cyan
+    Write-Host "Watchdog started in continuous mode. Running autonomously..." -ForegroundColor Cyan
 
     $lastHeartbeat  = Get-Date
     $lastRestart    = Get-Date

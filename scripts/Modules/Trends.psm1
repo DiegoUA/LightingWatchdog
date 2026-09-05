@@ -17,7 +17,7 @@ function Measure-Trend {
         $TrendData
     )
 
-    if ($TrendData -eq $null -or $TrendData.Count -lt 3) {
+    if ($null -eq $TrendData -or $TrendData.Count -lt 3) {
         return @{
             RollingAverage = $CurrentScore
             RollingStdDev  = 0
