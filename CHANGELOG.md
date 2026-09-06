@@ -3,6 +3,14 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [2.7.2] - 2026-09-06
+### Fixed
+- Enforced array typing in `Test-Quarantine` to prevent `op_Addition` datetime cast errors when processing sequential restart events.
+
+## [2.7.1] - 2026-09-06
+### Fixed
+- Resolved CSV schema conflicts by versioning export files (`diagnostics_v2.csv`, `HealthTrend_v2.csv`, `RestartEvents_v2.csv`) to avoid ghost process locks from previous watchdog versions.
+
 ## [2.7.0] - 2026-09-06
 ### Added
 - Abstracted hardcoded `LightingService` references into a dynamic `MonitoredServices` array in `config.json`.

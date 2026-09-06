@@ -80,7 +80,7 @@ function Test-Quarantine {
     if (-not $Config.EnableQuarantine) { return $false }
 
     $windowStart = $Now.AddMinutes(-$Config.QuarantineWindowMinutes)
-    $global:RestartHistory = $global:RestartHistory | Where-Object { $_ -ge $windowStart }
+    $global:RestartHistory = @($global:RestartHistory | Where-Object { $_ -ge $windowStart })
 
     if ($global:RestartHistory.Count -ge $Config.QuarantineRestartLimit) {
         return $true

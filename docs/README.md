@@ -134,6 +134,7 @@ From v2.7+, the system adds:
 | **v2.6.1** | 2026‑09‑05 | Removed GUI popups for fully autonomous headless operation. |
 | **v2.7.0** | 2026‑09‑06 | Abstracted configuration to support dynamic multi-service monitoring arrays. |
 | **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
+| **v2.7.2** | 2026‑09‑06 | Fixed op_Addition crash during sequential leak restarts. |
 
 ## Key Features
 
