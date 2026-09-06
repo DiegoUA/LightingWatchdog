@@ -171,8 +171,8 @@ function Invoke-Diagnostics {
     Write-Log -File $logFile -Message "Health Score: $($result.HealthScore)"
 
     # --- Trend analysis ---
-    $trendCsvPath       = Join-Path $exportFolder "HealthTrend.csv"
-    $diagnosticsCsvPath = Join-Path $exportFolder "diagnostics.csv"
+    $trendCsvPath       = Join-Path $exportFolder "HealthTrend_v2.csv"
+    $diagnosticsCsvPath = Join-Path $exportFolder "diagnostics_v2.csv"
 
     $trendData = Get-TrendData -CsvPath $trendCsvPath -Window $Config.TrendWindow
     $trend     = Measure-Trend -CurrentScore $result.HealthScore -TrendData $trendData

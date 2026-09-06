@@ -15,7 +15,7 @@ function Write-RestartEvent {
         New-Item -ItemType Directory -Path $exportFolder | Out-Null
     }
 
-    $restartCsvPath = Join-Path $exportFolder "RestartEvents.csv"
+    $restartCsvPath = Join-Path $exportFolder "RestartEvents_v2.csv"
 
     $row = New-Object PSObject -Property @{
         Timestamp       = $Result.Timestamp
