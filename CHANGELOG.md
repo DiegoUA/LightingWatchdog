@@ -3,6 +3,10 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [2.7.3] - 2026-09-06
+### Changed
+- Reverted default `MaxTcpConnections` threshold for `LightingService` back to `1000` in `config.json` to prevent premature triggers and optimize system resource efficiency.
+
 ## [2.7.2] - 2026-09-06
 ### Fixed
 - Enforced array typing in `Test-Quarantine` to prevent `op_Addition` datetime cast errors when processing sequential restart events.

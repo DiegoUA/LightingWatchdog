@@ -42,7 +42,7 @@
         {
             "ServiceName": "LightingService",
             "ProcessTree": ["LightingService", "AuraService"],
-            "MaxTcpConnections": 150,
+            "MaxTcpConnections": 1000,
             "EnableRestart": true
         }
     ]

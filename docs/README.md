@@ -135,6 +135,7 @@ From v2.7+, the system adds:
 | **v2.7.0** | 2026‑09‑06 | Abstracted configuration to support dynamic multi-service monitoring arrays. |
 | **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
 | **v2.7.2** | 2026‑09‑06 | Fixed op_Addition crash during sequential leak restarts. |
+| **v2.7.3** | 2026‑09‑06 | Restored optimal MaxTcpConnections threshold to 1000. |
 
 ## Key Features
 
