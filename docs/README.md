@@ -133,6 +133,8 @@ From v2.7+, the system adds:
 | **v2.6.0** | 2026‑09‑03 | Process tree termination (taskkill), TIME_WAIT socket flush cooldown loop, and pipeline type-safety fixes for logging module. |
 | **v2.6.1** | 2026‑09‑05 | Removed GUI popups for fully autonomous headless operation. |
 | **v2.7.0** | 2026‑09‑06 | Abstracted configuration to support dynamic multi-service monitoring arrays. |
+| **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
+
 ## Key Features
 
 - Leak detection and restart with cooldown for any configured service
