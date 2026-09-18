@@ -5,7 +5,6 @@ Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingS
 ---
 
 ## 📂 Project Structure
-## 📂 Project Structure
 ```text
 LightingWatchdog/
 │
@@ -14,6 +13,7 @@ LightingWatchdog/
 │       ├── Models/
 │       │   └── WatchdogConfig.cs
 │       ├── appsettings.json
+│       ├── NativeMethods.cs
 │       ├── NetworkWatchdogService.csproj
 │       ├── Program.cs
 │       └── Worker.cs
@@ -204,7 +204,7 @@ LightingWatchdog utilizes specific configuration files depending on the active e
 Edit thresholds, webhooks, and cooldown logic for the script-based monitor here:
 
 ```json
-config/config.jsonT.
+config/config.json.
 ```
 **2. .NET Background Service (v3.x+)**
 

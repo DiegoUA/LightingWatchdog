@@ -7,7 +7,6 @@ public class WatchdogConfig
     public bool EnableQuarantine { get; set; } = true;
     public int QuarantineWindowMinutes { get; set; } = 60;
     public int QuarantineRestartLimit { get; set; } = 3;
-    
     public List<MonitoredService> MonitoredServices { get; set; } = new();
 }
 
