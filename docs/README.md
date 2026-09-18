@@ -111,6 +111,7 @@ From v2.7+, the system adds:
 
 From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to run as a true Windows Background Service, paving the way for zero-overhead socket tracking via Event Tracing for Windows (ETW).
 - In-memory thread-safe connection tracking (`ConcurrentDictionary`) per monitored process tree.
+- **Event Tracing for Windows (ETW):** Direct kernel-level socket monitoring via `TraceEventSession`, replacing the CPU-heavy `Get-NetTCPConnection` polling loops.
 ---
 
 ## 🧩 Version History

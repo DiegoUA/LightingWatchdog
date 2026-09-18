@@ -13,6 +13,9 @@ All notable changes to LightingWatchdog are documented here.
 - Configured `appsettings.json` to define `LightingService` and `AuraService` in the `ProcessTree` with a 1000 TCP connection threshold.
 - Added `.gitignore` to repository tracking.
 - Realigned `README.md` Configuration section to reflect dual-engine (PowerShell and .NET) config paths.
+- Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead kernel network monitoring.
+- Implemented `StartEtwSession` background task in `Worker.cs` to asynchronously capture `TcpIpConnect`, `TcpIpAccept`, `TcpIpDisconnect`, and `TcpIpFail` kernel events.
+- Added strict `UnauthorizedAccessException` handling to enforce Administrator privilege requirements for ETW sessions.
 
 ### Changed
 - Initiated the architectural transition from PowerShell polling (`Get-NetTCPConnection`) to a high-performance, compiled C# service.
