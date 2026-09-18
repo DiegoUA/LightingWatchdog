@@ -10,6 +10,9 @@ All notable changes to LightingWatchdog are documented here.
 - Integrated `Microsoft.Extensions.Hosting.WindowsServices` to allow seamless installation as a native Windows Background Service.
 - Added `ConcurrentDictionary<int, int>` to `Worker.cs` to hold real-time per-PID connection metrics.
 - Added `EvaluateServiceHealth` loop matching configured `ProcessTree` binaries to active Windows PIDs and calculating aggregated connection usage.
+- Configured `appsettings.json` to define `LightingService` and `AuraService` in the `ProcessTree` with a 1000 TCP connection threshold.
+- Added `.gitignore` to repository tracking.
+- Realigned `README.md` Configuration section to reflect dual-engine (PowerShell and .NET) config paths.
 
 ### Changed
 - Initiated the architectural transition from PowerShell polling (`Get-NetTCPConnection`) to a high-performance, compiled C# service.

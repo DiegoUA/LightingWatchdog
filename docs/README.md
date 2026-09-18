@@ -197,12 +197,21 @@ Watchdog heartbeat: logs/heartbeat.json
 
 ## ⚙️ Configuration
 
-Edit thresholds in:
+LightingWatchdog utilizes specific configuration files depending on the active engine:
+
+**1. PowerShell Watchdog (v2.x)**  
+Edit thresholds, webhooks, and cooldown logic for the script-based monitor here:
 
 ```json
-config/config.json
+config/config.jsonT.
 ```
+**2. .NET Background Service (v3.x+)**
 
+The native C# service relies on the app settings to define process trees, TCP limits, and cooldown intervals natively in .NET. Edit targets here:
+
+```json
+src/NetworkWatchdogService/appsettings.json
+```
 ---
 
 ## 🧾 License

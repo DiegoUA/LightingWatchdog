@@ -14,3 +14,13 @@ Desktop.ini
 
 # OneDrive temp files
 *.tmp
+
+# .NET / C# Build Artifacts
+[bB]in/
+[oO]bj/
+
+# Visual Studio / IDE Files
+.vs/
+*.user
+*.userprefs
+*.suo
