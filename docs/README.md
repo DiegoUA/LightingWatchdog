@@ -5,8 +5,18 @@ Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingS
 ---
 
 ## 📂 Project Structure
+## 📂 Project Structure
 ```text
 LightingWatchdog/
+│
+├── src/
+│   └── NetworkWatchdogService/
+│       ├── Models/
+│       │   └── WatchdogConfig.cs
+│       ├── appsettings.json
+│       ├── NetworkWatchdogService.csproj
+│       ├── Program.cs
+│       └── Worker.cs
 │
 ├── scripts/
 │   ├── NetworkDiag.ps1
@@ -21,20 +31,13 @@ LightingWatchdog/
 │
 ├── logs/
 │   ├── export/
-│   │   ├── diag_*.json
-│   │   ├── diagnostics.csv
-│   │   ├── HealthTrend.csv
-│   │   └── RestartEvents.csv
 │   ├── heartbeat.json
 │   └── .gitkeep
-│
-├── .github/
-│   └── workflows/
-│       └── release.yml
 │
 ├── docs/
 │   └── README.md
 │
+├── .github/
 ├── .gitignore
 └── LICENSE
 
@@ -106,6 +109,8 @@ From v2.7+, the system adds:
 - Dynamic multi-service monitoring via `config.json` arrays
 - Fully autonomous headless console execution (no GUI interruptions)
 
+From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to run as a true Windows Background Service, paving the way for zero-overhead socket tracking via Event Tracing for Windows (ETW).
+- In-memory thread-safe connection tracking (`ConcurrentDictionary`) per monitored process tree.
 ---
 
 ## 🧩 Version History
@@ -136,6 +141,7 @@ From v2.7+, the system adds:
 | **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
 | **v2.7.2** | 2026‑09‑06 | Fixed op_Addition crash during sequential leak restarts. |
 | **v2.7.3** | 2026‑09‑06 | Restored optimal MaxTcpConnections threshold to 1000. |
+| **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. |git add 
 
 ## Key Features
 

@@ -3,6 +3,17 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [3.0.0] - 2026-09-19
+### Added
+- Scaffolded the foundation for a C# .NET 8 Worker Service (`NetworkWatchdogService`).
+- Created strongly-typed configuration models (`WatchdogConfig`, `MonitoredService`) to map JSON settings directly into the .NET runtime.
+- Integrated `Microsoft.Extensions.Hosting.WindowsServices` to allow seamless installation as a native Windows Background Service.
+- Added `ConcurrentDictionary<int, int>` to `Worker.cs` to hold real-time per-PID connection metrics.
+- Added `EvaluateServiceHealth` loop matching configured `ProcessTree` binaries to active Windows PIDs and calculating aggregated connection usage.
+
+### Changed
+- Initiated the architectural transition from PowerShell polling (`Get-NetTCPConnection`) to a high-performance, compiled C# service.
+
 ## [2.7.3] - 2026-09-06
 ### Changed
 - Reverted default `MaxTcpConnections` threshold for `LightingService` back to `1000` in `config.json` to prevent premature triggers and optimize system resource efficiency.
