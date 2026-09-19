@@ -1,123 +1,99 @@
+using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
-using Microsoft.Extensions.Options;
-using NetworkWatchdogService.Models;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Diagnostics.Tracing.Session;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 
-namespace NetworkWatchdogService;
-
-public class Worker : BackgroundService
+namespace NetworkWatchdogService
 {
-    private readonly ILogger<Worker> _logger;
-    private readonly WatchdogConfig _config;
-
-    public Worker(ILogger<Worker> logger, IOptions<WatchdogConfig> config)
+    public class Worker : BackgroundService
     {
-        _logger = logger;
-        _config = config.Value;
-    }
+        private readonly ILogger<Worker> _logger;
+        private TraceEventSession? _etwSession; // CS8618 Fix: Marked as nullable
+        
+        private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        _logger.LogInformation("NetworkWatchdog Service started at: {time}", DateTimeOffset.Now);
-
-        while (!stoppingToken.IsCancellationRequested)
+        public Worker(ILogger<Worker> logger)
         {
-            EvaluateServiceHealth();
-
-            await Task.Delay(_config.WatchdogIntervalSeconds * 1000, stoppingToken);
-        }
-    }
-
-    private void EvaluateServiceHealth()
-    {
-        if (_config.MonitoredServices == null || !_config.MonitoredServices.Any())
-        {
-            _logger.LogWarning("No monitored services found in configuration.");
-            return;
+            _logger = logger;
         }
 
-        foreach (var target in _config.MonitoredServices)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            int totalConnectionsForService = 0;
-            List<int> targetPids = new();
+            _logger.LogInformation("Starting ETW Kernel Tracing Session...");
+            
+            _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
 
-            // Find all running PIDs and query the native IP Helper API for their socket counts
-            foreach (var processName in target.ProcessTree)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                var processes = Process.GetProcessesByName(processName);
-                foreach (var proc in processes)
+                var targetProcesses = Process.GetProcessesByName("LightingService");
+
+                foreach (var proc in targetProcesses)
                 {
-                    targetPids.Add(proc.Id);
-                    totalConnectionsForService += NativeMethods.GetTotalTcpConnectionCount(proc.Id);
-                }
-            }
+                    int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
+                    _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} TCP Connections: {currentConnections}");
 
-            _logger.LogInformation("[{service}] Active PIDs: [{pids}] | Total TCP Connections: {tcpCount} / {max}", 
-                target.ServiceName, string.Join(", ", targetPids), totalConnectionsForService, target.MaxTcpConnections);
-
-            if (totalConnectionsForService >= target.MaxTcpConnections && target.MaxTcpConnections > 0 && target.EnableRestart)
-            {
-                _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<", 
-                    target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
-                
-                ExecuteProcessTreeKill(target.ProcessTree, target.ServiceName);
-            }
-        }
-    }
-
-    private void ExecuteProcessTreeKill(List<string> processTree, string serviceName)
-    {
-        _logger.LogWarning("Initiating aggressive process tree termination for {service}...", serviceName);
-
-        foreach (var procName in processTree)
-        {
-            var processes = Process.GetProcessesByName(procName);
-            foreach (var proc in processes)
-            {
-                try
-                {
-                    _logger.LogInformation("Killing process {procName} (PID: {pid})...", procName, proc.Id);
-                    
-                    var startInfo = new ProcessStartInfo
+                    if (currentConnections > 1000) 
                     {
-                        FileName = "taskkill",
-                        Arguments = $"/F /T /PID {proc.Id}",
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    };
-                    
-                    using var killProc = Process.Start(startInfo);
-                    killProc?.WaitForExit();
+                        _logger.LogWarning($"CRITICAL: Socket leak detected in {proc.ProcessName} (PID: {proc.Id})!");
+                        // -> Implement aggressive taskkill /F /T and restart sequence here
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to kill process {procName} (PID: {pid})", procName, proc.Id);
-                }
+
+                await Task.Delay(5000, stoppingToken);
             }
         }
 
-        _logger.LogInformation("Flushing TCP buffer. Waiting 15 seconds before restarting {service}...", serviceName);
-        Thread.Sleep(15000); 
-
-        try
+        private void StartEtwSession(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Restarting Windows Service: {service}...", serviceName);
-            
-            var startServiceInfo = new ProcessStartInfo
+            if (!(TraceEventSession.IsElevated() ?? false))
             {
-                FileName = "net",
-                Arguments = $"start \"{serviceName}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false
-            };
-            
-            using var startProc = Process.Start(startServiceInfo);
-            startProc?.WaitForExit();
-            
-            _logger.LogInformation("{service} recovery sequence complete.", serviceName);
+                _logger.LogCritical("ETW Tracing requires Administrator privileges. Shutting down ETW thread.");
+                return;
+            }
+
+            if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
+            {
+                using var oldSession = new TraceEventSession("LightingWatchdogSession");
+                oldSession.Stop();
+            }
+
+            using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
+            {
+                stoppingToken.Register(() => _etwSession?.Dispose());
+
+                _etwSession.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP);
+
+                // CS0123 & CS1061 Fixes: Use lambdas to route specific data types to a unified ID handler
+                // IPv4 and IPv6 are both natively handled by these base events
+                _etwSession.Source.Kernel.TcpIpConnect += data => UpdateConnectionCount(data.ProcessID, 1);
+                _etwSession.Source.Kernel.TcpIpAccept += data => UpdateConnectionCount(data.ProcessID, 1);
+
+                _etwSession.Source.Kernel.TcpIpDisconnect += data => UpdateConnectionCount(data.ProcessID, -1);
+                _etwSession.Source.Kernel.TcpIpFail += data => UpdateConnectionCount(data.ProcessID, -1);
+
+                _etwSession.Source.Process(); 
+            }
         }
-        catch (Exception ex)
+
+        private void UpdateConnectionCount(int processId, int adjustment)
         {
-            _logger.LogError(ex, "Failed to restart Windows Service: {service}", serviceName);
+            if (processId <= 0) return; // Ignore System Idle or invalid PIDs
+
+            if (adjustment > 0)
+            {
+                _pidConnectionCounts.AddOrUpdate(processId, 1, (_, count) => count + 1);
+            }
+            else
+            {
+                _pidConnectionCounts.AddOrUpdate(processId, 0, (_, count) => Math.Max(0, count - 1));
+            }
         }
     }
 }

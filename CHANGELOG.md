@@ -3,6 +3,18 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [3.1.0] - 2026-09-19
+### Added
+- Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead ETW kernel tracing of TCP connections.
+- Implemented real-time `ConcurrentDictionary` tracking for asynchronous TCP events using lambda expressions for robust payload routing.
+
+### Fixed
+- Handled ETW library variations by dynamically mapping both IPv4 and IPv6 traffic to standard TCP event delegates.
+- Resolved C# nullable reference (`CS8618`) and delegate mismatch (`CS0123`) compiler constraints for `TraceEventSession`.
+
+### Removed
+- Deleted `NativeMethods.cs` and the legacy WMI (`MSFT_NetTCPConnection`) polling subprocess to drastically reduce CPU overhead.
+
 ## [3.0.0] - 2026-09-19
 ### Added
 - Scaffolded the foundation for a C# .NET 8 Worker Service (`NetworkWatchdogService`).

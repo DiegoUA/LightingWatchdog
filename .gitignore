@@ -24,3 +24,6 @@ Desktop.ini
 *.user
 *.userprefs
 *.suo
+
+# Gemini Skill
+*.gemini

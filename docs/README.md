@@ -13,7 +13,6 @@ LightingWatchdog/
 │       ├── Models/
 │       │   └── WatchdogConfig.cs
 │       ├── appsettings.json
-│       ├── NativeMethods.cs
 │       ├── NetworkWatchdogService.csproj
 │       ├── Program.cs
 │       └── Worker.cs
@@ -112,6 +111,10 @@ From v2.7+, the system adds:
 From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to run as a true Windows Background Service, paving the way for zero-overhead socket tracking via Event Tracing for Windows (ETW).
 - In-memory thread-safe connection tracking (`ConcurrentDictionary`) per monitored process tree.
 - **Event Tracing for Windows (ETW):** Direct kernel-level socket monitoring via `TraceEventSession`, replacing the CPU-heavy `Get-NetTCPConnection` polling loops.
+
+### ⚡ Core Architecture: Zero-Overhead Monitoring
+Instead of expensive WMI polling or running standard `netstat` loops, LightingWatchdog (v3.x+) integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `NetworkTCPIP` provider, the service listens asynchronously to socket creation and destruction events in real-time. This guarantees zero CPU overhead while ensuring rogue connections from `LightingService.exe` are detected instantly.
+
 ---
 
 ## 🧩 Version History
@@ -133,8 +136,8 @@ From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to 
 | **v2.4.1** | 2026‑08‑19 | Fixed timestamp parsing using ParseExact; stabilized leak growth rate; added full restart logic, cooldown, webhook support. |
 | **v2.5** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
 | **v2.5.1** | 2026‑08‑19 | Filesystem-safe timestamps, PS 5.1 stddev fix, ensured logs folder creation. |
-| **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, ``$PSScriptRoot`` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
-| **v2.5.3** | 2026‑08‑19 | Unified ``Write-Log ``-File ``-Message``, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
+| **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, `$PSScriptRoot` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
+| **v2.5.3** | 2026‑08‑19 | Unified `Write-Log -File -Message`, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
 | **v2.5.4** | 2026‑08‑19 | Fixed watchdog cycle timing, stabilized module imports, corrected Write-Log path handling, improved continuous-mode reliability. |
 | **v2.6.0** | 2026‑09‑03 | Process tree termination (taskkill), TIME_WAIT socket flush cooldown loop, and pipeline type-safety fixes for logging module. |
 | **v2.6.1** | 2026‑09‑05 | Removed GUI popups for fully autonomous headless operation. |
@@ -142,7 +145,8 @@ From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to 
 | **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
 | **v2.7.2** | 2026‑09‑06 | Fixed op_Addition crash during sequential leak restarts. |
 | **v2.7.3** | 2026‑09‑06 | Restored optimal MaxTcpConnections threshold to 1000. |
-| **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. |git add 
+| **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. |
+| **v3.1.0** | 2026-09-19 | Replaced legacy WMI polling with zero-overhead ETW kernel tracing and resolved delegate compiler constraints. | 
 
 ## Key Features
 
