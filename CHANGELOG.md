@@ -3,6 +3,11 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [3.1.1] - 2026-09-19
+### Changed
+- Pivoted ETW kernel tracing provider from `NetworkTCPIP` to `Microsoft-Windows-Winsock-AFD`.
+- Implemented dynamic event parsing to track raw Winsock socket allocations (`Bound` state handles) that bypass the active TCP/IP transmission stack.
+
 ## [3.1.0] - 2026-09-19
 ### Added
 - Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead ETW kernel tracing of TCP connections.

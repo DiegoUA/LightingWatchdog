@@ -113,7 +113,7 @@ From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to 
 - **Event Tracing for Windows (ETW):** Direct kernel-level socket monitoring via `TraceEventSession`, replacing the CPU-heavy `Get-NetTCPConnection` polling loops.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
-Instead of expensive WMI polling or running standard `netstat` loops, LightingWatchdog (v3.x+) integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `NetworkTCPIP` provider, the service listens asynchronously to socket creation and destruction events in real-time. This guarantees zero CPU overhead while ensuring rogue connections from `LightingService.exe` are detected instantly.
+Instead of expensive WMI polling or running standard `netstat` loops, LightingWatchdog (v3.x+) integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `Microsoft-Windows-Winsock-AFD` provider via dynamic event parsing, the service listens asynchronously to raw socket allocations in real-time. This guarantees zero CPU overhead while ensuring rogue local handles from `LightingService.exe` are detected instantly before they even hit the transmission stack.
 
 ---
 

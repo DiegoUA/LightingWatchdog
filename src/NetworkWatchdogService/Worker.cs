@@ -7,15 +7,14 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Diagnostics.Tracing.Session;
-using Microsoft.Diagnostics.Tracing.Parsers;
-using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
+using Microsoft.Diagnostics.Tracing;
 
 namespace NetworkWatchdogService
 {
     public class Worker : BackgroundService
     {
         private readonly ILogger<Worker> _logger;
-        private TraceEventSession? _etwSession; // CS8618 Fix: Marked as nullable
+        private TraceEventSession? _etwSession;
         
         private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
 
@@ -26,7 +25,7 @@ namespace NetworkWatchdogService
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Starting ETW Kernel Tracing Session...");
+            _logger.LogInformation("Starting AFD Kernel Tracing Session...");
             
             _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
 
@@ -37,7 +36,7 @@ namespace NetworkWatchdogService
                 foreach (var proc in targetProcesses)
                 {
                     int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
-                    _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} TCP Connections: {currentConnections}");
+                    _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
 
                     if (currentConnections > 1000) 
                     {
@@ -54,7 +53,7 @@ namespace NetworkWatchdogService
         {
             if (!(TraceEventSession.IsElevated() ?? false))
             {
-                _logger.LogCritical("ETW Tracing requires Administrator privileges. Shutting down ETW thread.");
+                _logger.LogCritical("ETW Tracing requires Administrator privileges.");
                 return;
             }
 
@@ -68,31 +67,29 @@ namespace NetworkWatchdogService
             {
                 stoppingToken.Register(() => _etwSession?.Dispose());
 
-                _etwSession.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP);
-
-                // CS0123 & CS1061 Fixes: Use lambdas to route specific data types to a unified ID handler
-                // IPv4 and IPv6 are both natively handled by these base events
-                _etwSession.Source.Kernel.TcpIpConnect += data => UpdateConnectionCount(data.ProcessID, 1);
-                _etwSession.Source.Kernel.TcpIpAccept += data => UpdateConnectionCount(data.ProcessID, 1);
-
-                _etwSession.Source.Kernel.TcpIpDisconnect += data => UpdateConnectionCount(data.ProcessID, -1);
-                _etwSession.Source.Kernel.TcpIpFail += data => UpdateConnectionCount(data.ProcessID, -1);
+                // Use Dynamic Parser for non-standard or generic providers
+                _etwSession.Source.Dynamic.All += HandleAfdEvent;
+                
+                // Subscribe to the Ancillary Function Driver (Winsock API Bridge)
+                _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
 
                 _etwSession.Source.Process(); 
             }
         }
 
-        private void UpdateConnectionCount(int processId, int adjustment)
+        private void HandleAfdEvent(TraceEvent data)
         {
-            if (processId <= 0) return; // Ignore System Idle or invalid PIDs
+            if (data.ProcessID <= 0) return;
 
-            if (adjustment > 0)
+            // Track handle creation/binding
+            if (data.EventName.Contains("Bind") || data.EventName.Contains("Accept") || data.EventName.Contains("Connect"))
             {
-                _pidConnectionCounts.AddOrUpdate(processId, 1, (_, count) => count + 1);
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
             }
-            else
+            // Track handle destruction
+            else if (data.EventName.Contains("Close") || data.EventName.Contains("Abort") || data.EventName.Contains("Disconnect"))
             {
-                _pidConnectionCounts.AddOrUpdate(processId, 0, (_, count) => Math.Max(0, count - 1));
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
             }
         }
     }
