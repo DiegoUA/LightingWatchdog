@@ -80,7 +80,7 @@ namespace NetworkWatchdogService
                 if (proc == null) return 0;
 
                 int count = 0;
-                string line;
+                string? line;
                 string pidSuffix = $" {processId}"; // netstat outputs PID at the end of the line
 
                 while ((line = proc.StandardOutput.ReadLine()) != null)
