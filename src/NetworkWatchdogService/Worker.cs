@@ -15,7 +15,7 @@ namespace NetworkWatchdogService
     {
         private readonly ILogger<Worker> _logger;
         private TraceEventSession? _etwSession;
-        
+
         private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
         private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
 
@@ -27,7 +27,7 @@ namespace NetworkWatchdogService
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("Starting AFD Kernel Tracing Session...");
-            
+
             _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
@@ -40,11 +40,11 @@ namespace NetworkWatchdogService
                     if (!_baselineInitialized.ContainsKey(proc.Id))
                     {
                         int baseline = GetBaselineSocketCount(proc.Id);
-                        
+
                         // Add baseline to any events ETW might have already caught
                         _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
                         _baselineInitialized.TryAdd(proc.Id, true);
-                        
+
                         _logger.LogInformation($"[PID {proc.Id}] Baseline initialized with {baseline} pre-existing handles.");
                     }
 
@@ -52,10 +52,10 @@ namespace NetworkWatchdogService
                     int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                     _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
 
-                    if (currentConnections > 1000) 
+                    if (currentConnections > 1000)
                     {
                         _logger.LogWarning($"CRITICAL: Socket leak detected in {proc.ProcessName} (PID: {proc.Id})!");
-                        // -> Implement aggressive taskkill /F /T and restart sequence here
+                        RestartLeakingService(proc.ProcessName, proc.Id);
                     }
                 }
 
@@ -69,28 +69,22 @@ namespace NetworkWatchdogService
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "netstat",
-                    Arguments = "-ano",
+                    FileName = "powershell",
+                    Arguments = $"-NoProfile -Command \"(Get-NetTCPConnection -OwningProcess {processId} -ErrorAction SilentlyContinue).Count\"",
                     RedirectStandardOutput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
-                
+
                 using var proc = Process.Start(psi);
                 if (proc == null) return 0;
 
-                int count = 0;
-                string? line;
-                string pidSuffix = $" {processId}"; // netstat outputs PID at the end of the line
-
-                while ((line = proc.StandardOutput.ReadLine()) != null)
+                string output = proc.StandardOutput.ReadToEnd().Trim();
+                if (int.TryParse(output, out int count))
                 {
-                    if (line.EndsWith(pidSuffix))
-                    {
-                        count++;
-                    }
+                    return count;
                 }
-                return count;
+                return 0;
             }
             catch (Exception ex)
             {
@@ -119,7 +113,7 @@ namespace NetworkWatchdogService
 
                 _etwSession.Source.Dynamic.All += HandleAfdEvent;
                 _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-                _etwSession.Source.Process(); 
+                _etwSession.Source.Process();
             }
         }
 
@@ -134,6 +128,44 @@ namespace NetworkWatchdogService
             else if (data.EventName.Contains("Close") || data.EventName.Contains("Abort") || data.EventName.Contains("Disconnect"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
+            }
+        } // <-- Add this closing brace
+
+        private void RestartLeakingService(string serviceName, int processId)
+        {
+            _logger.LogWarning($"Attempting graceful stop of {serviceName}...");
+            ExecuteCommand("sc", $"stop {serviceName}");
+
+            _logger.LogWarning($"Force killing process tree for PID {processId}...");
+            ExecuteCommand("taskkill", $"/F /T /PID {processId}");
+
+            _logger.LogWarning("Process dead. Waiting 15s for Windows kernel to flush sockets...");
+            Thread.Sleep(15000);
+
+            _logger.LogInformation($"Sockets flushed. Restarting {serviceName}...");
+            ExecuteCommand("sc", $"start {serviceName}");
+
+            // Reset dictionaries so the baseline re-initializes on the next loop
+            _pidConnectionCounts.TryRemove(processId, out _);
+            _baselineInitialized.TryRemove(processId, out _);
+        }
+        private void ExecuteCommand(string filename, string arguments)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = filename,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Command failed: {filename} {arguments}");
             }
         }
     }

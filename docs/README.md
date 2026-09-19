@@ -147,8 +147,7 @@ LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v2.7.1** | 2026‑09‑06 | Resolved CSV schema conflicts by versioning export files. |
 | **v2.7.2** | 2026‑09‑06 | Fixed op_Addition crash during sequential leak restarts. |
 | **v2.7.3** | 2026‑09‑06 | Restored optimal MaxTcpConnections threshold to 1000. |
-| **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. |
-| **v3.1.0** | 2026-09-19 | Replaced legacy WMI polling with zero-overhead ETW kernel tracing and resolved delegate compiler constraints. | 
+| **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. Replaced legacy polling with zero-overhead ETW kernel tracing, baseline socket initialization, and aggressive taskkill restart loop. | 
 
 ## Key Features
 

@@ -3,44 +3,26 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
-## [3.1.2] - 2026-09-19
-### Added
-- Implemented a one-time `netstat -ano` baseline initialization for newly discovered PIDs to accurately account for sockets leaked prior to the ETW session starting.
-- Added `_baselineInitialized` concurrent tracking to prevent ETW delta overwrites during the baseline polling phase.
-
-## [3.1.1] - 2026-09-19
-### Changed
-- Pivoted ETW kernel tracing provider from `NetworkTCPIP` to `Microsoft-Windows-Winsock-AFD`.
-- Implemented dynamic event parsing to track raw Winsock socket allocations (`Bound` state handles) that bypass the active TCP/IP transmission stack.
-
-## [3.1.0] - 2026-09-19
-### Added
-- Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead ETW kernel tracing of TCP connections.
-- Implemented real-time `ConcurrentDictionary` tracking for asynchronous TCP events using lambda expressions for robust payload routing.
-
-### Fixed
-- Handled ETW library variations by dynamically mapping both IPv4 and IPv6 traffic to standard TCP event delegates.
-- Resolved C# nullable reference (`CS8618`) and delegate mismatch (`CS0123`) compiler constraints for `TraceEventSession`.
-
-### Removed
-- Deleted `NativeMethods.cs` and the legacy WMI (`MSFT_NetTCPConnection`) polling subprocess to drastically reduce CPU overhead.
-
 ## [3.0.0] - 2026-09-19
 ### Added
 - Scaffolded the foundation for a C# .NET 8 Worker Service (`NetworkWatchdogService`).
-- Created strongly-typed configuration models (`WatchdogConfig`, `MonitoredService`) to map JSON settings directly into the .NET runtime.
-- Integrated `Microsoft.Extensions.Hosting.WindowsServices` to allow seamless installation as a native Windows Background Service.
-- Added `ConcurrentDictionary<int, int>` to `Worker.cs` to hold real-time per-PID connection metrics.
-- Added `EvaluateServiceHealth` loop matching configured `ProcessTree` binaries to active Windows PIDs and calculating aggregated connection usage.
-- Configured `appsettings.json` to define `LightingService` and `AuraService` in the `ProcessTree` with a 1000 TCP connection threshold.
-- Added `.gitignore` to repository tracking.
-- Realigned `README.md` Configuration section to reflect dual-engine (PowerShell and .NET) config paths.
-- Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead kernel network monitoring.
-- Implemented `StartEtwSession` background task in `Worker.cs` to asynchronously capture `TcpIpConnect`, `TcpIpAccept`, `TcpIpDisconnect`, and `TcpIpFail` kernel events.
-- Added strict `UnauthorizedAccessException` handling to enforce Administrator privilege requirements for ETW sessions.
+- Created strongly-typed configuration models (`WatchdogConfig`, `MonitoredService`) to map JSON settings.
+- Integrated `Microsoft.Extensions.Hosting.WindowsServices` for native Windows Background Service installation.
+- Added `ConcurrentDictionary<int, int>` to track real-time per-PID connection metrics.
+- Integrated `Microsoft.Diagnostics.Tracing.TraceEvent` for zero-overhead kernel network monitoring via `Microsoft-Windows-Winsock-AFD`.
+- Implemented real-time tracking for asynchronous TCP events using dynamic event parsing for raw Winsock socket allocations.
+- Implemented a one-time `netstat -ano` baseline initialization for newly discovered PIDs to track pre-existing leaked sockets.
+- Added `RestartLeakingService` method to trigger a 15-second socket flush wait and aggressive process tree termination.
 
 ### Changed
-- Initiated the architectural transition from PowerShell polling (`Get-NetTCPConnection`) to a high-performance, compiled C# service.
+- Initiated the architectural transition from PowerShell polling to a high-performance, compiled C# service.
+
+### Fixed
+- Resolved C# nullable reference (`CS8618`) and delegate mismatch (`CS0123`) compiler constraints for `TraceEventSession`.
+- Fixed missing braces in `HandleAfdEvent` causing `CS1513` and `CS1022` compiler errors.
+
+### Removed
+- Deleted `NativeMethods.cs` and the legacy WMI polling subprocess to drastically reduce CPU overhead.
 
 ## [2.7.3] - 2026-09-06
 ### Changed
