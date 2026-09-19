@@ -3,6 +3,11 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [3.1.2] - 2026-09-19
+### Added
+- Implemented a one-time `netstat -ano` baseline initialization for newly discovered PIDs to accurately account for sockets leaked prior to the ETW session starting.
+- Added `_baselineInitialized` concurrent tracking to prevent ETW delta overwrites during the baseline polling phase.
+
 ## [3.1.1] - 2026-09-19
 ### Changed
 - Pivoted ETW kernel tracing provider from `NetworkTCPIP` to `Microsoft-Windows-Winsock-AFD`.

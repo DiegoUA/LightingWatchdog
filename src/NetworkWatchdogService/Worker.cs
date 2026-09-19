@@ -17,6 +17,7 @@ namespace NetworkWatchdogService
         private TraceEventSession? _etwSession;
         
         private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
+        private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
 
         public Worker(ILogger<Worker> logger)
         {
@@ -35,6 +36,19 @@ namespace NetworkWatchdogService
 
                 foreach (var proc in targetProcesses)
                 {
+                    // 1. One-time baseline initialization
+                    if (!_baselineInitialized.ContainsKey(proc.Id))
+                    {
+                        int baseline = GetBaselineSocketCount(proc.Id);
+                        
+                        // Add baseline to any events ETW might have already caught
+                        _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
+                        _baselineInitialized.TryAdd(proc.Id, true);
+                        
+                        _logger.LogInformation($"[PID {proc.Id}] Baseline initialized with {baseline} pre-existing handles.");
+                    }
+
+                    // 2. Read live count
                     int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                     _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
 
@@ -46,6 +60,42 @@ namespace NetworkWatchdogService
                 }
 
                 await Task.Delay(5000, stoppingToken);
+            }
+        }
+
+        private int GetBaselineSocketCount(int processId)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "netstat",
+                    Arguments = "-ano",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                
+                using var proc = Process.Start(psi);
+                if (proc == null) return 0;
+
+                int count = 0;
+                string line;
+                string pidSuffix = $" {processId}"; // netstat outputs PID at the end of the line
+
+                while ((line = proc.StandardOutput.ReadLine()) != null)
+                {
+                    if (line.EndsWith(pidSuffix))
+                    {
+                        count++;
+                    }
+                }
+                return count;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get baseline socket count for PID {pid}", processId);
+                return 0;
             }
         }
 
@@ -67,12 +117,8 @@ namespace NetworkWatchdogService
             {
                 stoppingToken.Register(() => _etwSession?.Dispose());
 
-                // Use Dynamic Parser for non-standard or generic providers
                 _etwSession.Source.Dynamic.All += HandleAfdEvent;
-                
-                // Subscribe to the Ancillary Function Driver (Winsock API Bridge)
                 _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-
                 _etwSession.Source.Process(); 
             }
         }
@@ -81,12 +127,10 @@ namespace NetworkWatchdogService
         {
             if (data.ProcessID <= 0) return;
 
-            // Track handle creation/binding
             if (data.EventName.Contains("Bind") || data.EventName.Contains("Accept") || data.EventName.Contains("Connect"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
             }
-            // Track handle destruction
             else if (data.EventName.Contains("Close") || data.EventName.Contains("Abort") || data.EventName.Contains("Disconnect"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
