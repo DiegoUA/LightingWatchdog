@@ -116,14 +116,10 @@ namespace NetworkWatchdogService
 
         private void HandleAfdEvent(TraceEvent data)
         {
-            // 1. Proactive PID Filter: Discard irrelevant kernel events instantly
-            if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID))
-            {
-                return;
-            }
+            if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
 
-            // 2. Parse AFD Socket Allocations (Strict 1:1 Lifecycle Mapping)
-            if (data.EventName.Contains("AfdCreate"))
+            // Track actual connection establishments instead of raw allocations
+            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
             }
