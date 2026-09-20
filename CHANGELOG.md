@@ -6,6 +6,7 @@ All notable changes to LightingWatchdog are documented here.
 ## [Unreleased]
 ### Added
 - Implemented proactive PID filtering in the ETW `TraceEventSession` callback to discard irrelevant Windows socket events and optimize CPU footprint.
+- `TelemetryExporter.cs` to natively export `HealthTrend_v2.csv` and `RestartEvents_v2.csv` snapshots directly from the C# worker, replacing the legacy PowerShell telemetry logic.
 
 ### Fixed
     - Fixed ETW event name string matching in `Worker.cs` to correctly intercept `AfdCreate/Open`, `AfdBindWithAddress/Open`, and `AfdConnectWithAddress/Bound` kernel events.

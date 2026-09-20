@@ -52,11 +52,8 @@ namespace NetworkWatchdogService
                     int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                     _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
 
-                    if (currentConnections > 1000)
-                    {
-                        _logger.LogWarning($"CRITICAL: Socket leak detected in {proc.ProcessName} (PID: {proc.Id})!");
-                        RestartLeakingService(proc.ProcessName, proc.Id);
-                    }
+                    // ---> NEW: Export telemetry snapshot
+                    TelemetryExporter.RecordHealthSnapshot(proc.ProcessName, proc.Id, currentConnections);
                 }
 
                 await Task.Delay(5000, stoppingToken);
@@ -138,6 +135,9 @@ namespace NetworkWatchdogService
 
         private void RestartLeakingService(string serviceName, int processId)
         {
+            // ---> NEW: Record restart event
+            TelemetryExporter.RecordRestart(serviceName, processId, "Exceeded 1000 socket threshold");
+
             _logger.LogWarning($"Attempting graceful stop of {serviceName}...");
             ExecuteCommand("sc", $"stop {serviceName}");
 
