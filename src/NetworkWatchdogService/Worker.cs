@@ -122,12 +122,12 @@ namespace NetworkWatchdogService
                 return;
             }
 
-            // 2. Parse AFD Socket Allocations based on discovered kernel event names
-            if (data.EventName.Contains("AfdCreate") || data.EventName.Contains("AfdBind") || data.EventName.Contains("AfdConnect"))
+            // 2. Parse AFD Socket Allocations (Strict 1:1 Lifecycle Mapping)
+            if (data.EventName.Contains("AfdCreate"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
             }
-            else if (data.EventName.Contains("AfdClose") || data.EventName.Contains("AfdDisconnect"))
+            else if (data.EventName.Contains("AfdClose"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
             }
