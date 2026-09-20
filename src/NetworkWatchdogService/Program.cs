@@ -1,6 +1,11 @@
 using Microsoft.Extensions.Hosting.WindowsServices;
 using NetworkWatchdogService;
 using NetworkWatchdogService.Models;
+using System;
+    using System.IO;
+
+    // ---> NEW: Fix Windows Service working directory defaulting to System32
+    Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory);
 
 var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
 {
