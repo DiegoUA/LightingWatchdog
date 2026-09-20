@@ -3,6 +3,10 @@
 All notable changes to LightingWatchdog are documented here.
 
 ---
+## [Unreleased]
+### Added
+- Implemented proactive PID filtering in the ETW `TraceEventSession` callback to discard irrelevant Windows socket events and optimize CPU footprint.
+
 ## [3.0.0] - 2026-09-19
 ### Added
 - Scaffolded the foundation for a C# .NET 8 Worker Service (`NetworkWatchdogService`).

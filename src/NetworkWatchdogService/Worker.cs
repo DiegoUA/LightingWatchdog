@@ -18,6 +18,7 @@ namespace NetworkWatchdogService
 
         private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
         private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
+        private readonly ConcurrentDictionary<int, int> _trackedPids = new();
 
         public Worker(ILogger<Worker> logger)
         {
@@ -119,17 +120,22 @@ namespace NetworkWatchdogService
 
         private void HandleAfdEvent(TraceEvent data)
         {
-            if (data.ProcessID <= 0) return;
+            // 1. Proactive PID Filter: Discard irrelevant kernel events instantly
+            if (data.ProcessID == 0 || !_trackedPids.ContainsKey(data.ProcessID))
+            {
+                return;
+            }
 
-            if (data.EventName.Contains("Bind") || data.EventName.Contains("Accept") || data.EventName.Contains("Connect"))
+            // 2. Parse AFD Socket Allocations
+            if (data.EventName == "AfdBind" || data.EventName.Contains("Connect"))
             {
-                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
+                _trackedPids.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
             }
-            else if (data.EventName.Contains("Close") || data.EventName.Contains("Abort") || data.EventName.Contains("Disconnect"))
+            else if (data.EventName == "AfdClose" || data.EventName.Contains("Disconnect"))
             {
-                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
+                _trackedPids.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
             }
-        } // <-- Add this closing brace
+        }
 
         private void RestartLeakingService(string serviceName, int processId)
         {

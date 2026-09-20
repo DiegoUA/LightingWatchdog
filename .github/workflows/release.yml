@@ -21,14 +21,15 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = process.env.GITHUB_REF.split('/').pop();
+            const tag = process.env.GITHUB_REF_NAME;
             const notes = `Automated release for ${tag}\n\nSee CHANGELOG.md for full details.`;
             core.setOutput('body', notes);
 
       - name: Publish Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          make_latest: true
