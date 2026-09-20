@@ -1,6 +1,12 @@
 #Requires -RunAsAdministrator
 
 $projectName = "NetworkWatchdogService"
+
+Write-Host "Stopping existing service to unlock files..." -ForegroundColor Cyan
+sc.exe stop $projectName | Out-Null
+# Give Windows 3 seconds to fully release the file locks
+Start-Sleep -Seconds 3 
+
 $projectPath = Join-Path -Path $PSScriptRoot -ChildPath "..\src\NetworkWatchdogService\NetworkWatchdogService.csproj"
 $publishDir = Join-Path -Path $PSScriptRoot -ChildPath "..\bin\Release"
 
@@ -14,11 +20,7 @@ if (-Not (Test-Path $exePath)) {
     exit 1
 }
 
-Write-Host "Stopping existing service (if any)..." -ForegroundColor Cyan
-sc.exe stop $projectName | Out-Null
-Start-Sleep -Seconds 2
-
-Write-Host "Creating Windows Service..." -ForegroundColor Cyan
+Write-Host "Creating Windows Service (will harmlessly fail if it already exists)..." -ForegroundColor Cyan
 sc.exe create $projectName binPath= "$exePath" start= auto DisplayName= "Network Watchdog Service"
 
 Write-Host "Setting Service Description..." -ForegroundColor Cyan
@@ -31,4 +33,4 @@ sc.exe failure $projectName reset= 86400 actions= restart/60000/restart/60000/re
 Write-Host "Starting Service..." -ForegroundColor Cyan
 sc.exe start $projectName
 
-Write-Host "Installation Complete! Service is now running autonomously." -ForegroundColor Green
+Write-Host "Installation/Update Complete! Service is now running autonomously." -ForegroundColor Green
