@@ -125,15 +125,12 @@ namespace NetworkWatchdogService
                 return;
             }
 
-            // DEBUG: Print the exact raw event name the kernel is using
-            _logger.LogWarning($"[DEBUG ETW] {data.EventName} intercepted for PID {data.ProcessID}");
-
-            // 2. Parse AFD Socket Allocations
-            if (data.EventName == "AfdBind" || data.EventName.Contains("Connect"))
+            // 2. Parse AFD Socket Allocations based on discovered kernel event names
+            if (data.EventName.Contains("AfdCreate") || data.EventName.Contains("AfdBind") || data.EventName.Contains("AfdConnect"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
             }
-            else if (data.EventName == "AfdClose" || data.EventName.Contains("Disconnect"))
+            else if (data.EventName.Contains("AfdClose") || data.EventName.Contains("AfdDisconnect"))
             {
                 _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
             }

@@ -7,6 +7,10 @@ All notable changes to LightingWatchdog are documented here.
 ### Added
 - Implemented proactive PID filtering in the ETW `TraceEventSession` callback to discard irrelevant Windows socket events and optimize CPU footprint.
 
+### Fixed
+    - Fixed ETW event name string matching in `Worker.cs` to correctly intercept `AfdCreate/Open`, `AfdBindWithAddress/Open`, and `AfdConnectWithAddress/Bound` kernel events.
+    - Removed `[DEBUG ETW]` console logger now that Winsock event names are properly resolved.
+
 ## [3.0.0] - 2026-09-19
 ### Added
 - Scaffolded the foundation for a C# .NET 8 Worker Service (`NetworkWatchdogService`).
