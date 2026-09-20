@@ -13,6 +13,7 @@ All notable changes to LightingWatchdog are documented here.
 - `scripts/Install-Service.ps1` to compile, publish, and register the .NET Worker Service to the Windows Service Control Manager with automatic restart failure recovery.
 - `scripts/Uninstall-Service.ps1` to safely stop and remove the Windows Service.
 - Fixed a critical ETW tracking bug in `Worker.cs` where the socket counter was artificially inflated by +3 per connection due to matching multiple stages of a single socket's lifecycle (`Create`, `Bind`, `Connect`). The tracker now enforces a strict 1:1 mapping using only `AfdCreate` and `AfdClose`.
+- `scripts/Setup-GitHooks.ps1` to automatically generate and install a Git `pre-commit` hook that blocks commits if the C# `.csproj` fails to compile.
 
 ### Fixed
 
