@@ -4,7 +4,7 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
-## [Unreleased]
+## [3.0.1] - 2026-09-21
 
 ### Added
 
@@ -20,6 +20,9 @@ All notable changes to LightingWatchdog are documented here.
 - Fixed ETW event name string matching in `Worker.cs` to correctly intercept `AfdCreate/Open`, `AfdBindWithAddress/Open`, and `AfdConnectWithAddress/Bound` kernel events.
 - Removed `[DEBUG ETW]` console logger now that Winsock event names are properly resolved.
 - Fixed a critical initialization bug where running as a Windows Service caused the application to look in `C:\Windows\System32` for `appsettings.json`. The base path is now explicitly forced to the executable's directory.
+- Changed ETW event targets to `AfdConnect` and `AfdAccept` to correctly track real-time socket creation.
+- Reordered `Install-Service.ps1` to stop the Windows Service prior to running `dotnet publish`, resolving file lock access violations.
+- Added `Directory.SetCurrentDirectory` to `Program.cs` to ensure the Service Control Manager reads `appsettings.json` from the application directory instead of `C:\Windows\System32`.
 
 ## [3.0.0] - 2026-09-19
 
