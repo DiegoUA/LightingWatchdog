@@ -18,7 +18,6 @@ namespace NetworkWatchdogService
 
         private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
         private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
-        private readonly ConcurrentDictionary<int, int> _trackedPids = new();
 
         public Worker(ILogger<Worker> logger)
         {
@@ -121,19 +120,22 @@ namespace NetworkWatchdogService
         private void HandleAfdEvent(TraceEvent data)
         {
             // 1. Proactive PID Filter: Discard irrelevant kernel events instantly
-            if (data.ProcessID == 0 || !_trackedPids.ContainsKey(data.ProcessID))
+            if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID))
             {
                 return;
             }
 
+            // DEBUG: Print the exact raw event name the kernel is using
+            _logger.LogWarning($"[DEBUG ETW] {data.EventName} intercepted for PID {data.ProcessID}");
+
             // 2. Parse AFD Socket Allocations
             if (data.EventName == "AfdBind" || data.EventName.Contains("Connect"))
             {
-                _trackedPids.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
             }
             else if (data.EventName == "AfdClose" || data.EventName.Contains("Disconnect"))
             {
-                _trackedPids.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
             }
         }
 
