@@ -1,196 +1,235 @@
-using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Diagnostics.Tracing.Session;
+using System.ServiceProcess;
 using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Session;
+using Microsoft.Extensions.Options;
+using NetworkWatchdogService.Models;
 
-namespace NetworkWatchdogService
+namespace NetworkWatchdogService;
+
+public class Worker : BackgroundService
 {
-    public class Worker : BackgroundService
+    private readonly ILogger<Worker> _logger;
+    private readonly WatchdogConfig _config;
+    private TraceEventSession? _etwSession;
+
+    private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
+    private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
+    private readonly Dictionary<string, DateTime> _lastRestartTimes = new();
+
+    public Worker(ILogger<Worker> logger, IOptions<WatchdogConfig> config)
     {
-        private readonly ILogger<Worker> _logger;
-        private TraceEventSession? _etwSession;
+        _logger = logger;
+        _config = config.Value;
+    }
 
-        private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
-        private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Starting AFD Kernel Tracing Session...");
+        StartEtwSession(stoppingToken);
 
-        public Worker(ILogger<Worker> logger)
+        while (!stoppingToken.IsCancellationRequested)
         {
-            _logger = logger;
-        }
-
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            _logger.LogInformation("Starting AFD Kernel Tracing Session...");
-
-            StartEtwSession(stoppingToken);
-
-            while (!stoppingToken.IsCancellationRequested)
+            foreach (var target in _config.MonitoredServices)
             {
-                var targetProcesses = Process.GetProcessesByName("LightingService");
+                int totalConnectionsForService = 0;
+                List<int> targetPids = new();
 
-                foreach (var proc in targetProcesses)
+                foreach (var processName in target.ProcessTree)
                 {
-                    // 1. One-time baseline initialization
-                    if (!_baselineInitialized.ContainsKey(proc.Id))
+                    foreach (var proc in Process.GetProcessesByName(processName))
                     {
-                        int baseline = GetBaselineSocketCount(proc.Id);
+                        targetPids.Add(proc.Id);
 
-                        // Add baseline to any events ETW might have already caught
-                        _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
-                        _baselineInitialized.TryAdd(proc.Id, true);
+                        // 1. One-time baseline initialization
+                        if (!_baselineInitialized.ContainsKey(proc.Id))
+                        {
+                            int baseline = GetBaselineSocketCount(proc.Id);
+                            _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
+                            _baselineInitialized.TryAdd(proc.Id, true);
+                            _logger.LogInformation("[PID {pid}] Baseline initialized with {baseline} pre-existing handles for {process}.", proc.Id, baseline, processName);
+                        }
 
-                        _logger.LogInformation($"[PID {proc.Id}] Baseline initialized with {baseline} pre-existing handles.");
-                    }
+                        // 2. Read live count for this PID
+                        int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
+                        totalConnectionsForService += currentConnections;
 
-                    // 2. Read live count
-                    int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
-                    _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
-
-                    // 3. Export telemetry snapshot
-                    TelemetryExporter.RecordHealthSnapshot(proc.ProcessName, proc.Id, currentConnections);
-
-                    // 4. Enforce threshold limit (1000 sockets)
-                    if (currentConnections >= 1000)
-                    {
-                        _logger.LogWarning($"[PID {proc.Id}] Socket threshold exceeded ({currentConnections} >= 1000). Triggering service recovery...");
-                        RestartLeakingService("LightingService", proc.Id);
+                        // 3. Export telemetry snapshot
+                        TelemetryExporter.RecordHealthSnapshot(processName, proc.Id, currentConnections);
                     }
                 }
 
-                await Task.Delay(5000, stoppingToken);
+                _logger.LogInformation("[{service}] Total TCP Connections: {tcpCount} / {max}", 
+                    target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
+
+                // 4. Enforce threshold limit and recovery
+                if (totalConnectionsForService >= target.MaxTcpConnections && target.MaxTcpConnections > 0)
+                {
+                    _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<", 
+                        target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
+
+                    HandleServiceRecovery(target, targetPids);
+                }
             }
+
+            await Task.Delay(_config.WatchdogIntervalSeconds * 1000, stoppingToken);
+        }
+    }
+
+    private int GetBaselineSocketCount(int processId)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell",
+                Arguments = $"-NoProfile -Command \"(Get-NetTCPConnection -OwningProcess {processId} -ErrorAction SilentlyContinue).Count\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return 0;
+
+            string output = proc.StandardOutput.ReadToEnd().Trim();
+            if (int.TryParse(output, out int count))
+            {
+                return count;
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get baseline socket count for PID {pid}", processId);
+            return 0;
+        }
+    }
+
+    private void StartEtwSession(CancellationToken stoppingToken)
+    {
+        if (!(TraceEventSession.IsElevated() ?? false))
+        {
+            _logger.LogCritical("ETW Tracing requires Administrator privileges.");
+            return;
         }
 
-        private int GetBaselineSocketCount(int processId)
+        if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
+        {
+            using var oldSession = new TraceEventSession("LightingWatchdogSession");
+            oldSession.Stop();
+        }
+
+        _etwSession = new TraceEventSession("LightingWatchdogSession");
+
+        stoppingToken.Register(() => 
+        {
+            _etwSession?.Stop();
+            _etwSession?.Dispose();
+        });
+
+        _etwSession.Source.Dynamic.All += HandleAfdEvent;
+        _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
+
+        Task.Run(() =>
         {
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "powershell",
-                    Arguments = $"-NoProfile -Command \"(Get-NetTCPConnection -OwningProcess {processId} -ErrorAction SilentlyContinue).Count\"",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using var proc = Process.Start(psi);
-                if (proc == null) return 0;
-
-                string output = proc.StandardOutput.ReadToEnd().Trim();
-                if (int.TryParse(output, out int count))
-                {
-                    return count;
-                }
-                return 0;
+                _etwSession.Source.Process();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to get baseline socket count for PID {pid}", processId);
-                return 0;
+                _logger.LogError(ex, "ETW session processing encountered an error.");
             }
-        }
+        }, stoppingToken);
+    }
 
-        private void StartEtwSession(CancellationToken stoppingToken)
+    private void HandleAfdEvent(TraceEvent data)
+    {
+        if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
+
+        if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
         {
-            if (!(TraceEventSession.IsElevated() ?? false))
+            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
+        }
+        else if (data.EventName.Contains("AfdClose"))
+        {
+            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
+        }
+    }
+
+    private void HandleServiceRecovery(MonitoredService target, List<int> pids)
+    {
+        if (!target.EnableRestart) return;
+
+        if (_lastRestartTimes.TryGetValue(target.ServiceName, out var lastRestart))
+        {
+            if ((DateTime.UtcNow - lastRestart).TotalMinutes < _config.CooldownSeconds)
             {
-                _logger.LogCritical("ETW Tracing requires Administrator privileges.");
+                _logger.LogInformation("Service {service} is in cooldown period. Skipping restart.", target.ServiceName);
                 return;
             }
-
-            if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
-            {
-                using var oldSession = new TraceEventSession("LightingWatchdogSession");
-                oldSession.Stop();
-            }
-
-            // Create persistent session instance (removed inner using block to prevent premature disposal)
-            _etwSession = new TraceEventSession("LightingWatchdogSession");
-
-            stoppingToken.Register(() => 
-            {
-                _etwSession?.Stop();
-                _etwSession?.Dispose();
-            });
-
-            _etwSession.Source.Dynamic.All += HandleAfdEvent;
-            _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-
-            // Process ETW events asynchronously on a background thread
-            Task.Run(() =>
-            {
-                try
-                {
-                    _etwSession.Source.Process();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "ETW session processing encountered an error.");
-                }
-            }, stoppingToken);
         }
 
-        private void HandleAfdEvent(TraceEvent data)
+        TelemetryExporter.RecordRestart(target.ServiceName, pids.FirstOrDefault(), $"Exceeded {target.MaxTcpConnections} socket threshold");
+
+        _logger.LogWarning("Initiating recovery sequence for {service}...", target.ServiceName);
+
+        foreach (var pid in pids)
         {
-            if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
-
-            // Track actual connection establishments instead of raw allocations
-            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
-            {
-                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
-            }
-            else if (data.EventName.Contains("AfdClose"))
-            {
-                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
-            }
+            ExecuteCommand("taskkill", $"/F /T /PID {pid}");
         }
 
-        private void RestartLeakingService(string serviceName, int processId)
-        {
-            TelemetryExporter.RecordRestart(serviceName, processId, "Exceeded 1000 socket threshold");
-
-            _logger.LogWarning($"Attempting graceful stop of {serviceName}...");
-            ExecuteCommand("sc", $"stop {serviceName}");
-
-            _logger.LogWarning($"Force killing process tree for PID {processId}...");
-            ExecuteCommand("taskkill", $"/F /T /PID {processId}");
-
-            _logger.LogWarning("Process dead. Waiting 15s for Windows kernel to flush sockets...");
-            Thread.Sleep(15000);
-
-            _logger.LogInformation($"Sockets flushed. Restarting {serviceName}...");
-            ExecuteCommand("sc", $"start {serviceName}");
-
-            // Reset dictionaries so the baseline re-initializes on the next loop
-            _pidConnectionCounts.TryRemove(processId, out _);
-            _baselineInitialized.TryRemove(processId, out _);
-        }
-
-        private void ExecuteCommand(string filename, string arguments)
+        if (OperatingSystem.IsWindows())
         {
             try
             {
-                var psi = new ProcessStartInfo
+                using var sc = new ServiceController(target.ServiceName);
+                if (sc.Status == ServiceControllerStatus.Running || sc.Status == ServiceControllerStatus.Paused)
                 {
-                    FileName = filename,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var proc = Process.Start(psi);
-                proc?.WaitForExit();
+                    sc.Stop();
+                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(10));
+                }
+                sc.Start();
+                _logger.LogInformation("Successfully restarted Windows Service: {service}", target.ServiceName);
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                _logger.LogError(ex, $"Command failed: {filename} {arguments}");
+                _logger.LogInformation("Windows Service control skipped or failed for {service}. Relying on process tree termination.", target.ServiceName);
             }
+        }
+        else
+        {
+            _logger.LogInformation("Windows Service control is unavailable on this platform for {service}. Relying on process tree termination.", target.ServiceName);
+        }
+
+        _lastRestartTimes[target.ServiceName] = DateTime.UtcNow;
+
+        foreach (var pid in pids)
+        {
+            _pidConnectionCounts.TryRemove(pid, out _);
+            _baselineInitialized.TryRemove(pid, out _);
+        }
+    }
+
+    private void ExecuteCommand(string filename, string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = filename,
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Command failed: {filename} {arguments}", filename, arguments);
         }
     }
 }
