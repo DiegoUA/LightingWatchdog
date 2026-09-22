@@ -28,7 +28,7 @@ namespace NetworkWatchdogService
         {
             _logger.LogInformation("Starting AFD Kernel Tracing Session...");
 
-            _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
+            StartEtwSession(stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -52,8 +52,15 @@ namespace NetworkWatchdogService
                     int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                     _logger.LogInformation($"[PID {proc.Id}] {proc.ProcessName} Winsock Handles: {currentConnections}");
 
-                    // ---> NEW: Export telemetry snapshot
+                    // 3. Export telemetry snapshot
                     TelemetryExporter.RecordHealthSnapshot(proc.ProcessName, proc.Id, currentConnections);
+
+                    // 4. Enforce threshold limit (1000 sockets)
+                    if (currentConnections >= 1000)
+                    {
+                        _logger.LogWarning($"[PID {proc.Id}] Socket threshold exceeded ({currentConnections} >= 1000). Triggering service recovery...");
+                        RestartLeakingService("LightingService", proc.Id);
+                    }
                 }
 
                 await Task.Delay(5000, stoppingToken);
@@ -104,14 +111,30 @@ namespace NetworkWatchdogService
                 oldSession.Stop();
             }
 
-            using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
-            {
-                stoppingToken.Register(() => _etwSession?.Dispose());
+            // Create persistent session instance (removed inner using block to prevent premature disposal)
+            _etwSession = new TraceEventSession("LightingWatchdogSession");
 
-                _etwSession.Source.Dynamic.All += HandleAfdEvent;
-                _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-                _etwSession.Source.Process();
-            }
+            stoppingToken.Register(() => 
+            {
+                _etwSession?.Stop();
+                _etwSession?.Dispose();
+            });
+
+            _etwSession.Source.Dynamic.All += HandleAfdEvent;
+            _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
+
+            // Process ETW events asynchronously on a background thread
+            Task.Run(() =>
+            {
+                try
+                {
+                    _etwSession.Source.Process();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "ETW session processing encountered an error.");
+                }
+            }, stoppingToken);
         }
 
         private void HandleAfdEvent(TraceEvent data)
@@ -131,7 +154,6 @@ namespace NetworkWatchdogService
 
         private void RestartLeakingService(string serviceName, int processId)
         {
-            // ---> NEW: Record restart event
             TelemetryExporter.RecordRestart(serviceName, processId, "Exceeded 1000 socket threshold");
 
             _logger.LogWarning($"Attempting graceful stop of {serviceName}...");
@@ -150,6 +172,7 @@ namespace NetworkWatchdogService
             _pidConnectionCounts.TryRemove(processId, out _);
             _baselineInitialized.TryRemove(processId, out _);
         }
+
         private void ExecuteCommand(string filename, string arguments)
         {
             try

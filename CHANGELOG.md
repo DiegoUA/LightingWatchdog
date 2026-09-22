@@ -23,6 +23,8 @@ All notable changes to LightingWatchdog are documented here.
 - Changed ETW event targets to `AfdConnect` and `AfdAccept` to correctly track real-time socket creation.
 - Reordered `Install-Service.ps1` to stop the Windows Service prior to running `dotnet publish`, resolving file lock access violations.
 - Added `Directory.SetCurrentDirectory` to `Program.cs` to ensure the Service Control Manager reads `appsettings.json` from the application directory instead of `C:\Windows\System32`.
+- **ETW Session Lifecycle:** Resolved a critical bug where premature disposal of the `TraceEventSession` inside a synchronous `using` block blinded the background worker. 
+- **Thread Starvation:** Unblocked the main health evaluation loop by wrapping ETW event processing in an asynchronous background task (`Task.Run`), ensuring the 1000-socket threshold checker reliably triggers the process recovery and socket flushing sequence.
 
 ## [3.0.0] - 2026-09-19
 
