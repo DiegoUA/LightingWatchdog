@@ -4,6 +4,22 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.1.0] - 2026-09-23
+
+### Added
+
+- Introduced `NetworkWatchdog.TrayApp`, a lightweight companion system tray monitor for user sessions.
+- Implemented real-time dynamic tray icon coloring (Green for normal, Orange for elevated, Red for critical socket leaks) based on telemetry CSV polling.
+- Added interactive tooltips showing live process IDs, service names, and active connection counts upon hovering over the tray icon.
+
+### Changed
+
+- Synchronized full directory trees in `README.md`, to accurately reflect the new multi-project `src/` structure containing both the Worker Service and the Tray App without truncating legacy directories.
+- Updated project capability descriptions to officially document the graphical system tray monitoring features.
+- Moved `README.md` from the `docs/` directory to the repository root to align with standard GitHub repository practices and enable automatic landing page rendering.
+- Removed the obsolete `docs/` folder.
+- Optimized the `README.md` Description section by replacing the verbose bullet lists with a condensed `Feature Milestones` summary, perfectly aligning feature additions with their historical release tags (`v2.5.x` through `v3.1.x`) and significantly reducing visual clutter.
+
 ## [3.0.1] - 2026-09-21
 
 ### Added
@@ -23,7 +39,7 @@ All notable changes to LightingWatchdog are documented here.
 - Changed ETW event targets to `AfdConnect` and `AfdAccept` to correctly track real-time socket creation.
 - Reordered `Install-Service.ps1` to stop the Windows Service prior to running `dotnet publish`, resolving file lock access violations.
 - Added `Directory.SetCurrentDirectory` to `Program.cs` to ensure the Service Control Manager reads `appsettings.json` from the application directory instead of `C:\Windows\System32`.
-- **ETW Session Lifecycle:** Resolved a critical bug where premature disposal of the `TraceEventSession` inside a synchronous `using` block blinded the background worker. 
+- **ETW Session Lifecycle:** Resolved a critical bug where premature disposal of the `TraceEventSession` inside a synchronous `using` block blinded the background worker.
 - **Thread Starvation:** Unblocked the main health evaluation loop by wrapping ETW event processing in an asynchronous background task (`Task.Run`), ensuring the 1000-socket threshold checker reliably triggers the process recovery and socket flushing sequence.
 
 ## [3.0.0] - 2026-09-19

@@ -8,126 +8,67 @@ Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingS
 
 ```text
 LightingWatchdog/
-│
-├── .github/
-│   └── workflows/
-│       └── release.yml
-│
-├── bin/
-│
-├── config/
-│   └── config.json
-│
-├── docs/
-│   └── README.md
-│
-├── logs/
-│   ├── export/
-│   ├── .gitkeep
-│   └── heartbeat.json
-│
-├── scripts/
-│   ├── Modules/
-│   │   ├── Diagnostics.psm1
-│   │   ├── Trends.psm1
-│   │   ├── Utils.psm1
-│   │   └── Watchdog.psm1
-│   ├── Install-Service.ps1
-│   ├── NetworkDiag.ps1
-│   ├── Setup-GitHooks.ps1
-│   └── Uninstall-Service.ps1
-│
-├── src/
-│   └── NetworkWatchdogService/
-│       ├── bin/
-│       ├── Models/
-│       │   └── WatchdogConfig.cs
-│       ├── obj/
-│       ├── Properties/
-│       ├── appsettings.Development.json
-│       ├── appsettings.json
-│       ├── NetworkWatchdogService.csproj
-│       ├── Program.cs
-│       ├── TelemetryExporter.cs
-│       └── Worker.cs
-│
-├── .gitignore
-├── CHANGELOG.md
-└── LICENSE
-
+    │
+    ├── .github/
+    │   └── workflows/
+    │       └── release.yml
+    │
+    ├── bin/
+    │
+    ├── config/
+    │   └── config.json
+    │
+    ├── logs/
+    │   ├── export/
+    │   ├── .gitkeep
+    │   └── heartbeat.json
+    │
+    ├── scripts/
+    │   ├── Modules/
+    │   │   ├── Diagnostics.psm1
+    │   │   ├── Trends.psm1
+    │   │   ├── Utils.psm1
+    │   │   └── Watchdog.psm1
+    │   ├── Install-Service.ps1
+    │   ├── NetworkDiag.ps1
+    │   ├── Setup-GitHooks.ps1
+    │   └── Uninstall-Service.ps1
+    │
+    ├── src/
+    │   ├── NetworkWatchdogService/
+    │   │   ├── bin/
+    │   │   ├── Models/
+    │   │   │   └── WatchdogConfig.cs
+    │   │   ├── obj/
+    │   │   ├── Properties/
+    │   │   ├── appsettings.Development.json
+    │   │   ├── appsettings.json
+    │   │   ├── NetworkWatchdogService.csproj
+    │   │   ├── Program.cs
+    │   │   ├── TelemetryExporter.cs
+    │   │   └── Worker.cs
+    │   │
+    │   └── NetworkWatchdog.TrayApp/
+    │       ├── NetworkWatchdog.TrayApp.csproj
+    │       └── Program.cs
+    │
+    ├── .gitignore
+    ├── CHANGELOG.md
+    ├── LICENSE
+    └── README.md
 ```
 
 ## ⚙️ Description
 
-LightingWatchdog is a modular Windows diagnostic and watchdog system designed to detect and mitigate:
+LightingWatchdog is a modular Windows diagnostic and watchdog system designed to detect and mitigate TCP/UDP socket leaks, runaway connection storms, nonpaged pool exhaustion, and kernel memory pressure.
 
-- TCP/UDP socket leaks
+**Feature Milestones:**
 
-- LightingService runaway connection storms
-
-- Nonpaged pool exhaustion
-
-- WebSocket storms
-
-- Kernel memory pressure
-
-From v2.x, the system supports:
-
-- Modular diagnostics
-
-- Configurable thresholds
-
-- Continuous watchdog mode
-
-- Structured JSON/CSV exports
-
-- Service Health Scoring
-
-- Trend and anomaly analysis
-
-From v2.4+, the system adds:
-
-- Restart reason tracking
-
-- Leak growth rate measurement
-
-- Kernel memory pressure trend
-
-- Cooldown logic to avoid restart storms
-
-- Optional webhook notifications (Telegram/Discord via HTTP POST)
-
-From v2.5+, the system includes:
-
-- ISO‑8601 timestamps
-
-- Optional UTC mode
-
-- Heartbeat file (logs/heartbeat.json)
-
-- Clock drift detection
-
-- Quarantine mode
-
-- Auto‑kill for runaway processes
-
-- Watchdog health scoring
-
-From v2.6+, the system includes:
-
-- Aggressive process tree termination (taskkill) for orphaned child processes.
-
-- Safe TCP TIME_WAIT kernel flush loops prior to service restoration.
-
-From v2.7+, the system adds:
-
-- Dynamic multi-service monitoring via `config.json` arrays
-- Fully autonomous headless console execution (no GUI interruptions)
-
-From v3.0+, the system introduces a native C# .NET 8 Worker Service designed to run as a true Windows Background Service, paving the way for zero-overhead socket tracking via Event Tracing for Windows (ETW).
-
-- In-memory thread-safe connection tracking (`ConcurrentDictionary`) per monitored process tree.
-- **Event Tracing for Windows (ETW):** Direct kernel-level socket monitoring via `TraceEventSession`, replacing the CPU-heavy `Get-NetTCPConnection` polling loops.
+- **v2.5.x:** Configurable thresholds, JSON/CSV exports, health scoring, leak growth tracking, webhook notifications, quarantine mode, and auto-kill for runaway processes.
+- **v2.6.x:** Aggressive process tree termination (taskkill) and safe TCP TIME_WAIT kernel flush loops.
+- **v2.7.x:** Dynamic multi-service monitoring arrays and fully headless execution.
+- **v3.0.x:** Native C# .NET 8 Worker Service using zero-overhead Event Tracing for Windows (ETW) for kernel-level socket tracking.
+- **v3.1.x:** `NetworkWatchdog.TrayApp` graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
@@ -168,6 +109,7 @@ LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v2.7.3** | 2026‑09‑06 | Restored optimal MaxTcpConnections threshold to 1000. |
 | **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. Replaced legacy polling with zero-overhead ETW kernel tracing, baseline socket initialization, and aggressive taskkill restart loop. |
 | **v3.0.1** | 2026‑09‑21 | Fixed SCM working directory pathing, corrected ETW Winsock AFD event mappings (AfdConnect/AfdAccept), and resolved Install-Service.ps1 file locking issues. |
+| **v3.1.0** | 2026‑09‑23 | Added NetworkWatchdog.TrayApp companion for user session tray monitoring, real-time status coloring, and synchronized directory trees across documentation. |
 
 ## Key Features
 
@@ -225,14 +167,15 @@ Watchdog heartbeat: logs/heartbeat.json
 
 LightingWatchdog utilizes specific configuration files depending on the active engine:
 
-**1. PowerShell Watchdog (v2.x)**  
+### 1. PowerShell Watchdog (v2.x)
+
 Edit thresholds, webhooks, and cooldown logic for the script-based monitor here:
 
 ```json
 config/config.json.
 ```
 
-**2. .NET Background Service (v3.x+)**
+### 2. .NET Background Service (v3.x+)
 
 The native C# service relies on the app settings to define process trees, TCP limits, and cooldown intervals natively in .NET. Edit targets here:
 
