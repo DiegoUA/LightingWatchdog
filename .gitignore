@@ -25,5 +25,8 @@ Desktop.ini
 *.userprefs
 *.suo
 
-# Gemini Skill
+# Gemini *.md files
 *.gemini
+
+#.markdownlint.yaml instructions
+.markdownlint.yaml

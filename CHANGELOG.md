@@ -4,6 +4,14 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.2.0] - 2026-09-24
+
+### Added
+
+- Implemented universal process monitoring (`MonitorAllProcesses` and `GlobalMaxTcpConnections`) in `WatchdogConfig` and `Worker.cs` to safeguard the entire system against rogue socket leaks from any executable.
+- Added real-time CSV restart parsing and native Windows balloon notifications in `NetworkWatchdog.TrayApp` when socket thresholds are breached and mitigated.
+- Added a toggleable "Silent Mode" option in the system tray context menu to suppress pop-up alerts on demand.
+
 ## [3.1.0] - 2026-09-23
 
 ### Added

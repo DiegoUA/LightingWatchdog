@@ -7,6 +7,8 @@ public class WatchdogConfig
     public bool EnableQuarantine { get; set; } = true;
     public int QuarantineWindowMinutes { get; set; } = 60;
     public int QuarantineRestartLimit { get; set; } = 3;
+    public bool MonitorAllProcesses { get; set; } = true;
+    public int GlobalMaxTcpConnections { get; set; } = 1500;
     public List<MonitoredService> MonitoredServices { get; set; } = new();
 }
 

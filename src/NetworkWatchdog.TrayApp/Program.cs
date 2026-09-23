@@ -13,19 +13,6 @@ namespace NetworkWatchdog.TrayApp
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-
-            // Fully qualify System.Windows.Forms.Timer to resolve CS0104 ambiguity
-            System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer
-            {
-                Interval = 5000
-            };
-
-            statusTimer.Tick += (sender, e) =>
-            {
-                // Background status polling logic for tray icon tooltip and color state
-            };
-            statusTimer.Start();
-
             Application.Run(new TrayApplicationContext());
         }
     }
@@ -34,25 +21,38 @@ namespace NetworkWatchdog.TrayApp
     {
         private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _timer;
-        private readonly string _csvPath;
+        private readonly string _csvHealthPath;
+        private readonly string _csvRestartPath;
+        private bool _isSilentMode = false;
+        private string _lastRestartEvent = string.Empty;
 
         public TrayApplicationContext()
         {
-            // Point directly to the absolute path to completely bypass relative path traversal issues
-            _csvPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\HealthTrend_v2.csv";
+            _csvHealthPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\HealthTrend_v2.csv";
+            _csvRestartPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\RestartEvents_v2.csv";
 
             _trayIcon = new NotifyIcon
             {
                 Icon = CreateSolidIcon(Color.Gray),
-                Text = "NetworkWatchdog: Initializing...",
+                Text = "NetworkWatchdog: Universal Monitor Initializing...",
                 Visible = true,
                 ContextMenuStrip = new ContextMenuStrip()
             };
 
+            var silentItem = new ToolStripMenuItem("Silent Mode", null, (s, e) =>
+            {
+                _isSilentMode = !_isSilentMode;
+                ((ToolStripMenuItem)s!).Checked = _isSilentMode;
+                _trayIcon.ShowBalloonTip(2000, "NetworkWatchdog", 
+                    _isSilentMode ? "Silent mode enabled. Pop-ups suppressed." : "Alert notifications enabled.", 
+                    ToolTipIcon.Info);
+            });
+
+            _trayIcon.ContextMenuStrip.Items.Add(silentItem);
             _trayIcon.ContextMenuStrip.Items.Add("Exit", null, (s, e) => Exit());
 
             _timer = new System.Windows.Forms.Timer { Interval = 3000 };
-            _timer.Tick += (s, e) => CheckHealthStatus();
+            _timer.Tick += (s, e) => { CheckHealthStatus(); CheckForRestarts(); };
             _timer.Start();
         }
 
@@ -60,21 +60,10 @@ namespace NetworkWatchdog.TrayApp
         {
             try
             {
-                if (!File.Exists(_csvPath))
-                {
-                    _trayIcon.Icon = CreateSolidIcon(Color.Gray);
-                    _trayIcon.Text = $"NetworkWatchdog: Waiting for telemetry...\n(Path not found: {_csvPath})";
-                    return;
-                }
+                if (!File.Exists(_csvHealthPath)) return;
 
-                // Fixed CS8600 by explicitly handling potential null returns
-                string? lastLine = File.ReadLines(_csvPath).LastOrDefault();
-                if (string.IsNullOrWhiteSpace(lastLine) || lastLine.StartsWith("Timestamp"))
-                {
-                    _trayIcon.Icon = CreateSolidIcon(Color.Gray);
-                    _trayIcon.Text = "NetworkWatchdog: Reading log header...";
-                    return;
-                }
+                string? lastLine = File.ReadLines(_csvHealthPath).LastOrDefault();
+                if (string.IsNullOrWhiteSpace(lastLine) || lastLine.StartsWith("Timestamp")) return;
 
                 var parts = lastLine.Split(',');
                 if (parts.Length >= 4 && int.TryParse(parts[3], out int activeConnections))
@@ -85,24 +74,44 @@ namespace NetworkWatchdog.TrayApp
                     if (activeConnections < 500)
                     {
                         _trayIcon.Icon = CreateSolidIcon(Color.Green);
-                        _trayIcon.Text = $"{serviceName} (PID {pid})\nStatus: Healthy\nConnections: {activeConnections}";
+                        _trayIcon.Text = $"{serviceName} (PID {pid})\nHealthy: {activeConnections} sockets";
                     }
                     else if (activeConnections < 1000)
                     {
                         _trayIcon.Icon = CreateSolidIcon(Color.Orange);
-                        _trayIcon.Text = $"{serviceName} (PID {pid})\nStatus: Elevated Sockets\nConnections: {activeConnections}";
+                        _trayIcon.Text = $"{serviceName} (PID {pid})\nElevated: {activeConnections} sockets";
                     }
                     else
                     {
                         _trayIcon.Icon = CreateSolidIcon(Color.Red);
-                        _trayIcon.Text = $"{serviceName} (PID {pid})\nStatus: LEAK THRESHOLD EXCEEDED!\nConnections: {activeConnections}";
+                        _trayIcon.Text = $"{serviceName} (PID {pid})\nCRITICAL: {activeConnections} sockets";
                     }
                 }
             }
-            catch
+            catch { }
+        }
+
+        private void CheckForRestarts()
+        {
+            try
             {
-                // Suppress file lock contention during CSV writes
+                if (!File.Exists(_csvRestartPath)) return;
+
+                string? lastLine = File.ReadLines(_csvRestartPath).LastOrDefault();
+                if (string.IsNullOrWhiteSpace(lastLine) || lastLine.StartsWith("Timestamp")) return;
+
+                if (lastLine != _lastRestartEvent)
+                {
+                    _lastRestartEvent = lastLine;
+                    if (!_isSilentMode)
+                    {
+                        _trayIcon.ShowBalloonTip(4000, "⚠️ Socket Leak Mitigated!", 
+                            $"Rogue process breach detected and neutralized:\n{lastLine}", 
+                            ToolTipIcon.Warning);
+                    }
+                }
             }
+            catch { }
         }
 
         private Icon CreateSolidIcon(Color color)

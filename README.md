@@ -8,21 +8,13 @@ Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingS
 
 ```text
 LightingWatchdog/
-    │
     ├── .github/
     │   └── workflows/
     │       └── release.yml
-    │
-    ├── bin/
-    │
-    ├── config/
-    │   └── config.json
-    │
     ├── logs/
     │   ├── export/
     │   ├── .gitkeep
     │   └── heartbeat.json
-    │
     ├── scripts/
     │   ├── Modules/
     │   │   ├── Diagnostics.psm1
@@ -33,25 +25,19 @@ LightingWatchdog/
     │   ├── NetworkDiag.ps1
     │   ├── Setup-GitHooks.ps1
     │   └── Uninstall-Service.ps1
-    │
     ├── src/
     │   ├── NetworkWatchdogService/
-    │   │   ├── bin/
     │   │   ├── Models/
     │   │   │   └── WatchdogConfig.cs
-    │   │   ├── obj/
     │   │   ├── Properties/
-    │   │   ├── appsettings.Development.json
     │   │   ├── appsettings.json
     │   │   ├── NetworkWatchdogService.csproj
     │   │   ├── Program.cs
     │   │   ├── TelemetryExporter.cs
     │   │   └── Worker.cs
-    │   │
     │   └── NetworkWatchdog.TrayApp/
     │       ├── NetworkWatchdog.TrayApp.csproj
     │       └── Program.cs
-    │
     ├── .gitignore
     ├── CHANGELOG.md
     ├── LICENSE
@@ -69,6 +55,7 @@ LightingWatchdog is a modular Windows diagnostic and watchdog system designed to
 - **v2.7.x:** Dynamic multi-service monitoring arrays and fully headless execution.
 - **v3.0.x:** Native C# .NET 8 Worker Service using zero-overhead Event Tracing for Windows (ETW) for kernel-level socket tracking.
 - **v3.1.x:** `NetworkWatchdog.TrayApp` graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
+- **v3.2.x:** Universal system-wide process monitoring (`MonitorAllProcesses`) and tray balloon alerts with a toggleable Silent Mode.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
@@ -110,6 +97,7 @@ LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.0.0** | 2026‑09‑19 | Architectural shift: Scaffolded C# .NET 8 Worker Service for native Windows Service integration. Replaced legacy polling with zero-overhead ETW kernel tracing, baseline socket initialization, and aggressive taskkill restart loop. |
 | **v3.0.1** | 2026‑09‑21 | Fixed SCM working directory pathing, corrected ETW Winsock AFD event mappings (AfdConnect/AfdAccept), and resolved Install-Service.ps1 file locking issues. |
 | **v3.1.0** | 2026‑09‑23 | Added NetworkWatchdog.TrayApp companion for user session tray monitoring, real-time status coloring, and synchronized directory trees across documentation. |
+| **v3.2.0** | 2026‑09‑24 | Added universal system-wide process leak monitoring (`MonitorAllProcesses`), real-time CSV restart parsing, native Windows balloon notifications, and a toggleable Silent Mode context menu option. |
 
 ## Key Features
 

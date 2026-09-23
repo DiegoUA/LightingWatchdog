@@ -31,6 +31,7 @@ public class Worker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // 1. Evaluate Explicitly Monitored Services
             foreach (var target in _config.MonitoredServices)
             {
                 int totalConnectionsForService = 0;
@@ -42,7 +43,6 @@ public class Worker : BackgroundService
                     {
                         targetPids.Add(proc.Id);
 
-                        // 1. One-time baseline initialization
                         if (!_baselineInitialized.ContainsKey(proc.Id))
                         {
                             int baseline = GetBaselineSocketCount(proc.Id);
@@ -51,11 +51,9 @@ public class Worker : BackgroundService
                             _logger.LogInformation("[PID {pid}] Baseline initialized with {baseline} pre-existing handles for {process}.", proc.Id, baseline, processName);
                         }
 
-                        // 2. Read live count for this PID
                         int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                         totalConnectionsForService += currentConnections;
 
-                        // 3. Export telemetry snapshot
                         TelemetryExporter.RecordHealthSnapshot(processName, proc.Id, currentConnections);
                     }
                 }
@@ -63,13 +61,57 @@ public class Worker : BackgroundService
                 _logger.LogInformation("[{service}] Total TCP Connections: {tcpCount} / {max}", 
                     target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
 
-                // 4. Enforce threshold limit and recovery
                 if (totalConnectionsForService >= target.MaxTcpConnections && target.MaxTcpConnections > 0)
                 {
                     _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<", 
                         target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
 
                     HandleServiceRecovery(target, targetPids);
+                }
+            }
+
+            // 2. Universal Process Monitoring (If Enabled)
+            if (_config.MonitorAllProcesses)
+            {
+                foreach (var proc in Process.GetProcesses())
+                {
+                    try
+                    {
+                        int pid = proc.Id;
+                        if (pid <= 4) continue; // Skip System idle/kernel
+
+                        string procName = proc.ProcessName;
+                        bool isExplicitlyMonitored = _config.MonitoredServices.Any(s => s.ProcessTree.Contains(procName, StringComparer.OrdinalIgnoreCase));
+
+                        if (!isExplicitlyMonitored)
+                        {
+                            if (!_baselineInitialized.ContainsKey(pid))
+                            {
+                                int baseline = GetBaselineSocketCount(pid);
+                                _pidConnectionCounts.AddOrUpdate(pid, baseline, (_, current) => current + baseline);
+                                _baselineInitialized.TryAdd(pid, true);
+                            }
+
+                            int currentConnections = _pidConnectionCounts.GetOrAdd(pid, 0);
+                            TelemetryExporter.RecordHealthSnapshot(procName, pid, currentConnections);
+
+                            if (currentConnections >= _config.GlobalMaxTcpConnections && _config.GlobalMaxTcpConnections > 0)
+                            {
+                                _logger.LogWarning(">>> GLOBAL LEAK DETECTED: Process {proc} (PID {pid}) exceeded global threshold ({count}/{max}) <<<",
+                                    procName, pid, currentConnections, _config.GlobalMaxTcpConnections);
+
+                                ExecuteCommand("taskkill", $"/F /T /PID {pid}");
+                                TelemetryExporter.RecordRestart(procName, pid, $"Exceeded global {_config.GlobalMaxTcpConnections} socket threshold");
+                                
+                                _pidConnectionCounts.TryRemove(pid, out _);
+                                _baselineInitialized.TryRemove(pid, out _);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Handle race conditions where process exits during iteration
+                    }
                 }
             }
 
@@ -147,7 +189,16 @@ public class Worker : BackgroundService
 
     private void HandleAfdEvent(TraceEvent data)
     {
-        if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
+        if (data.ProcessID == 0) return;
+
+        // Automatically track PIDs if universal monitoring is enabled, or if already initialized
+        if (!_pidConnectionCounts.ContainsKey(data.ProcessID) && _config.MonitorAllProcesses)
+        {
+            _pidConnectionCounts.TryAdd(data.ProcessID, 0);
+            _baselineInitialized.TryAdd(data.ProcessID, true);
+        }
+
+        if (!_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
 
         if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
         {
