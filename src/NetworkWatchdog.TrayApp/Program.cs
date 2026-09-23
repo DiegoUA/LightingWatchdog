@@ -26,20 +26,20 @@ namespace NetworkWatchdog.TrayApp
             };
             statusTimer.Start();
 
-            Application.Run();
+            Application.Run(new TrayApplicationContext());
         }
     }
 
     public class TrayApplicationContext : ApplicationContext
     {
         private readonly NotifyIcon _trayIcon;
-        private readonly Timer _timer;
+        private readonly System.Windows.Forms.Timer _timer;
         private readonly string _csvPath;
 
         public TrayApplicationContext()
         {
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            _csvPath = Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "src", "NetworkWatchdogService", "bin", "Release", "logs", "export", "HealthTrend_v2.csv"));
+            // Point directly to the absolute path to completely bypass relative path traversal issues
+            _csvPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\HealthTrend_v2.csv";
 
             _trayIcon = new NotifyIcon
             {
@@ -51,7 +51,7 @@ namespace NetworkWatchdog.TrayApp
 
             _trayIcon.ContextMenuStrip.Items.Add("Exit", null, (s, e) => Exit());
 
-            _timer = new Timer { Interval = 3000 };
+            _timer = new System.Windows.Forms.Timer { Interval = 3000 };
             _timer.Tick += (s, e) => CheckHealthStatus();
             _timer.Start();
         }
@@ -63,13 +63,16 @@ namespace NetworkWatchdog.TrayApp
                 if (!File.Exists(_csvPath))
                 {
                     _trayIcon.Icon = CreateSolidIcon(Color.Gray);
-                    _trayIcon.Text = "NetworkWatchdog: Waiting for telemetry...";
+                    _trayIcon.Text = $"NetworkWatchdog: Waiting for telemetry...\n(Path not found: {_csvPath})";
                     return;
                 }
 
-                string lastLine = File.ReadLines(_csvPath).LastOrDefault();
+                // Fixed CS8600 by explicitly handling potential null returns
+                string? lastLine = File.ReadLines(_csvPath).LastOrDefault();
                 if (string.IsNullOrWhiteSpace(lastLine) || lastLine.StartsWith("Timestamp"))
                 {
+                    _trayIcon.Icon = CreateSolidIcon(Color.Gray);
+                    _trayIcon.Text = "NetworkWatchdog: Reading log header...";
                     return;
                 }
 

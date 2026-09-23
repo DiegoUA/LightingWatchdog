@@ -4,13 +4,6 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
-## [Unreleased]
-
-### Fixed
-
-- Resolved `CS0104` compiler ambiguity error between `System.Windows.Forms.Timer` and `System.Threading.Timer` in `src/NetworkWatchdog.TrayApp/Program.cs` by fully qualifying the timer instance.
-- Corrected a filename typo, renaming `etworkWatchdog.TrayApp.csproj` to `NetworkWatchdog.TrayApp.csproj`.
-
 ## [3.1.0] - 2026-09-23
 
 ### Added
@@ -18,6 +11,12 @@ All notable changes to LightingWatchdog are documented here.
 - Introduced `NetworkWatchdog.TrayApp`, a lightweight companion system tray monitor for user sessions.
 - Implemented real-time dynamic tray icon coloring (Green for normal, Orange for elevated, Red for critical socket leaks) based on telemetry CSV polling.
 - Added interactive tooltips showing live process IDs, service names, and active connection counts upon hovering over the tray icon.
+
+### Fixed
+
+- Resolved `CS0104` compiler ambiguity error between `System.Windows.Forms.Timer` and `System.Threading.Timer` in `src/NetworkWatchdog.TrayApp/Program.cs` by fully qualifying the timer instance.
+- Corrected a filename typo, renaming `etworkWatchdog.TrayApp.csproj` to `NetworkWatchdog.TrayApp.csproj`.
+- Fully qualified all references to `System.Windows.Forms.Timer` in `TrayApplicationContext` to completely resolve `CS0104` ambiguity errors.
 
 ### Changed
 
