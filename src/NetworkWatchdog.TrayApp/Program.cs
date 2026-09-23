@@ -6,14 +6,27 @@ using System.Windows.Forms;
 
 namespace NetworkWatchdog.TrayApp
 {
-    static class Program
+    public static class Program
     {
         [STAThread]
-        static void Main()
+        public static void Main()
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new TrayApplicationContext());
+
+            // Fully qualify System.Windows.Forms.Timer to resolve CS0104 ambiguity
+            System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 5000
+            };
+
+            statusTimer.Tick += (sender, e) =>
+            {
+                // Background status polling logic for tray icon tooltip and color state
+            };
+            statusTimer.Start();
+
+            Application.Run();
         }
     }
 

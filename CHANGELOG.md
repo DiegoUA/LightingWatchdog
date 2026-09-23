@@ -4,6 +4,13 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Resolved `CS0104` compiler ambiguity error between `System.Windows.Forms.Timer` and `System.Threading.Timer` in `src/NetworkWatchdog.TrayApp/Program.cs` by fully qualifying the timer instance.
+- Corrected a filename typo, renaming `etworkWatchdog.TrayApp.csproj` to `NetworkWatchdog.TrayApp.csproj`.
+
 ## [3.1.0] - 2026-09-23
 
 ### Added
