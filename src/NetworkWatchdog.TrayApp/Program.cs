@@ -130,7 +130,7 @@ namespace NetworkWatchdog.TrayApp
             try
             {
                 using var pipeClient = new NamedPipeClientStream(".", "NetworkWatchdogPipe", PipeDirection.InOut);
-                pipeClient.Connect(150);
+                pipeClient.Connect(1000);
 
                 using var reader = new StreamReader(pipeClient, Encoding.UTF8);
                 using var writer = new StreamWriter(pipeClient, Encoding.UTF8) { AutoFlush = true };
@@ -142,7 +142,10 @@ namespace NetworkWatchdog.TrayApp
                     return JsonSerializer.Deserialize<TelemetryPacket>(response);
                 }
             }
-            catch { }
+            catch (Exception)
+            {
+                // Silently fallback to CSV polling if pipe handshake drops
+            }
             return null;
         }
 

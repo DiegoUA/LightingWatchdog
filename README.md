@@ -58,13 +58,15 @@ LightingWatchdog is a modular Windows diagnostic and watchdog system designed to
 - **v3.1.x:** `NetworkWatchdog.TrayApp` graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
 - **v3.2.x:** Universal system-wide process monitoring (`MonitorAllProcesses`) and tray balloon alerts with a toggleable Silent Mode.
 - **v3.3.x:** Interactive Live Process Inspector Dashboard Form, context-menu manual process termination, and historical mitigation log viewer.
+- **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes (`NetworkWatchdogPipe`), runtime settings slider with whitelisting, and remote Syslog forwarding over UDP.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
 LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 
-1. **Initial Baseline:** Upon discovering a monitored process, the service executes a single, lightweight `netstat` snapshot to capture pre-existing socket leaks.
-2. **Zero-Overhead Tracking:** Ongoing monitoring integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `Microsoft-Windows-Winsock-AFD` provider, the service listens asynchronously to raw socket allocations in real-time, adding them to the baseline. This guarantees zero CPU overhead while ensuring rogue local handles are tracked accurately.
+1. **Initial Baseline:** Upon discovering a monitored or active process, the service executes a single, lightweight `netstat` snapshot to capture pre-existing socket leaks.
+2. **Zero-Overhead Tracking:** Ongoing monitoring integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `Microsoft-Windows-Winsock-AFD` provider, the service listens asynchronously to raw socket allocations in real-time, adding them to the baseline.
+3. **Inter-Process Streaming:** Telemetry is broadcast through a zero-disk I/O asynchronous Named Pipe server directly to the user-space tray companion.
 
 ---
 
@@ -101,6 +103,8 @@ LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.1.0** | 2026‑09‑23 | Added NetworkWatchdog.TrayApp companion for user session tray monitoring, real-time status coloring, and synchronized directory trees across documentation. |
 | **v3.2.0** | 2026‑09‑24 | Added universal system-wide process leak monitoring (`MonitorAllProcesses`), real-time CSV restart parsing, native Windows balloon notifications, and a toggleable Silent Mode context menu option. |
 | **v3.3.0** | 2026‑09‑24 | Added interactive Windows Forms Dashboard Form (live process telemetry grid, manual process tree termination, and historical mitigation viewer). |
+| **v3.4.0** | 2026‑09‑24 | Added Named Pipe IPC streaming, runtime threshold slider with process whitelisting, and UDP Syslog alert forwarding. |
+| **v3.4.1** | 2026-09-24 | Fixed SCM service startup timeout via assembly bundling, resolved PipeSecurity cross-session IPC access, and fixed TrayApp fallback initialization. |
 
 ## Key Features
 

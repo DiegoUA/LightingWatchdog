@@ -4,12 +4,20 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
-## [Unreleased]
+## [3.4.1] - 2026-09-24
+
+### Added
+
+- Embedded asynchronous `NamedPipeServerStream` (`NetworkWatchdogPipe`) directly inside `Worker.cs` to supply live telemetry snapshots and receive dashboard control commands.
 
 ### Fixed
 
 - Resolved `CS0649` compiler warning in `NetworkWatchdog.TrayApp` by properly assigning `_csvHealthPath` inline for fallback telemetry polling.
 - Removed obsolete unused restart CSV fields from the Tray Application context.
+- Resolved git repository index lock contention (`main.lock`) during automated commit and release sequences in cloud-synchronized local folders.
+- Fixed inter-process communication failures between the headless Windows Service (`LocalSystem`) and the desktop Tray App by introducing explicit `PipeSecurity` rules allowing `WorldSid` and `AuthenticatedUserSid` access.
+- Increased Tray App pipe connection timeout to 1000 ms to ensure smooth handshakes without premature fallback drops.
+- Resolved SCM service startup timeout (Error `1053` / `CLR20r3 FileNotFoundException`) by bundling Windows hosting assemblies using `<CopyLocalLockFileAssemblies>` and targeting `-r win-x64` single-file publishing.
 
 ## [3.4.0] - 2026-09-24
 

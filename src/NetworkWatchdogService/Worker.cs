@@ -1,321 +1,340 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.IO.Pipes;
-using System.ServiceProcess;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
-using Microsoft.Extensions.Options;
-using NetworkWatchdogService.Models;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
-namespace NetworkWatchdogService;
-
-public class Worker : BackgroundService
+namespace NetworkWatchdogService
 {
-    private readonly ILogger<Worker> _logger;
-    private readonly WatchdogConfig _config;
-    private TraceEventSession? _etwSession;
-
-    private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
-    private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
-    private readonly Dictionary<string, DateTime> _lastRestartTimes = new();
-    private readonly List<string> _recentRestarts = new();
-    private TelemetryPacket _latestPacket = new();
-
-    public Worker(ILogger<Worker> logger, IOptions<WatchdogConfig> config)
+    public class Worker : BackgroundService
     {
-        _logger = logger;
-        _config = config.Value;
-    }
+        private readonly ILogger<Worker> _logger;
+        private TraceEventSession? _etwSession;
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        _logger.LogInformation("Starting AFD Kernel Tracing Session and IPC Pipe Server...");
-        StartEtwSession(stoppingToken);
-        _ = StartNamedPipeServerAsync(stoppingToken);
+        private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
+        private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
+        private readonly ConcurrentBag<string> _recentRestarts = new();
+        private readonly HashSet<string> _whitelist = new(StringComparer.OrdinalIgnoreCase);
+        private int _globalMaxTcpConnections = 1500;
 
-        while (!stoppingToken.IsCancellationRequested)
+        public Worker(ILogger<Worker> logger)
         {
-            var telemetryBatch = new List<ProcessTelemetryItem>();
+            _logger = logger;
+        }
 
-            // 1. Evaluate Explicitly Monitored Services
-            foreach (var target in _config.MonitoredServices)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("Starting NetworkWatchdogService Worker...");
+
+            // 1. Start ETW Trace in Background
+            _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
+
+            // 2. Start Named Pipe Server for Tray App IPC
+            _ = Task.Run(() => StartNamedPipeServerAsync(stoppingToken), stoppingToken);
+
+            // 3. Health & Mitigation Loop
+            while (!stoppingToken.IsCancellationRequested)
             {
-                int totalConnectionsForService = 0;
-                List<int> targetPids = new();
+                var targetProcesses = Process.GetProcessesByName("LightingService");
 
-                foreach (var processName in target.ProcessTree)
+                foreach (var proc in targetProcesses)
                 {
-                    foreach (var proc in Process.GetProcessesByName(processName))
+                    if (!_baselineInitialized.ContainsKey(proc.Id))
                     {
-                        targetPids.Add(proc.Id);
+                        int baseline = GetBaselineSocketCount(proc.Id);
+                        _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
+                        _baselineInitialized.TryAdd(proc.Id, true);
+                        _logger.LogInformation("[PID {pid}] Baseline initialized with {count} sockets.", proc.Id, baseline);
+                    }
 
-                        if (!_baselineInitialized.ContainsKey(proc.Id))
+                    int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
+
+                    lock (_whitelist)
+                    {
+                        if (_whitelist.Contains(proc.ProcessName))
                         {
-                            int baseline = GetBaselineSocketCount(proc.Id);
-                            _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
-                            _baselineInitialized.TryAdd(proc.Id, true);
+                            continue;
                         }
+                    }
 
-                        int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
-                        totalConnectionsForService += currentConnections;
-
-                        string status = currentConnections < 500 ? "Healthy" : (currentConnections < target.MaxTcpConnections ? "Elevated" : "LEAK");
-                        telemetryBatch.Add(new ProcessTelemetryItem { ServiceName = processName, Pid = proc.Id, Connections = currentConnections, Status = status });
-                        TelemetryExporter.RecordHealthSnapshot(processName, proc.Id, currentConnections);
+                    if (currentConnections > _globalMaxTcpConnections)
+                    {
+                        _logger.LogWarning("CRITICAL: Socket leak breach ({count} > {max}) in {name} (PID: {pid})!", currentConnections, _globalMaxTcpConnections, proc.ProcessName, proc.Id);
+                        RestartLeakingService(proc.ProcessName, proc.Id, currentConnections);
                     }
                 }
 
-                if (totalConnectionsForService >= target.MaxTcpConnections && target.MaxTcpConnections > 0)
-                {
-                    _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<",
-                        target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
-
-                    SyslogNotifier.SendAlert(_config.Syslog, target.ServiceName, targetPids.FirstOrDefault(), totalConnectionsForService, target.MaxTcpConnections, "Service leak threshold breached");
-                    HandleServiceRecovery(target, targetPids);
-                }
+                await Task.Delay(5000, stoppingToken);
             }
+        }
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task StartNamedPipeServerAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("Initializing Named Pipe IPC Server: \\\\.\\pipe\\NetworkWatchdogPipe");
 
-            // 2. Universal Process Monitoring
-            if (_config.MonitorAllProcesses)
+            var pipeSecurity = new PipeSecurity();
+
+            // Grant Everyone (WorldSid) and Authenticated Users (AuthenticatedUserSid) full Read/Write access
+            var sidWorld = new System.Security.Principal.SecurityIdentifier(
+                System.Security.Principal.WellKnownSidType.WorldSid, null);
+            var sidAuth = new System.Security.Principal.SecurityIdentifier(
+                System.Security.Principal.WellKnownSidType.AuthenticatedUserSid, null);
+
+            pipeSecurity.AddAccessRule(new PipeAccessRule(
+                sidWorld,
+                PipeAccessRights.ReadWrite,
+                System.Security.AccessControl.AccessControlType.Allow));
+
+            pipeSecurity.AddAccessRule(new PipeAccessRule(
+                sidAuth,
+                PipeAccessRights.ReadWrite,
+                System.Security.AccessControl.AccessControlType.Allow));
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                foreach (var proc in Process.GetProcesses())
+                try
                 {
-                    try
+                    // Create using NamedPipeServerStreamAcl to bind security descriptor
+                    using var server = NamedPipeServerStreamAcl.Create(
+                        "NetworkWatchdogPipe",
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous,
+                        inBufferSize: 4096,
+                        outBufferSize: 4096,
+                        pipeSecurity);
+
+                    await server.WaitForConnectionAsync(stoppingToken);
+
+                    using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
+                    using var writer = new StreamWriter(server, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+
+                    string? line = await reader.ReadLineAsync(stoppingToken);
+                    if (!string.IsNullOrWhiteSpace(line))
                     {
-                        int pid = proc.Id;
-                        if (pid <= 4) continue;
-
-                        string procName = proc.ProcessName;
-                        if (_config.ProcessWhitelist.Contains(procName, StringComparer.OrdinalIgnoreCase)) continue;
-
-                        bool isExplicitlyMonitored = _config.MonitoredServices.Any(s => s.ProcessTree.Contains(procName, StringComparer.OrdinalIgnoreCase));
-                        if (!isExplicitlyMonitored)
+                        if (line == "GET_TELEMETRY")
                         {
-                            if (!_baselineInitialized.ContainsKey(pid))
+                            var packet = BuildTelemetryPacket();
+                            string json = JsonSerializer.Serialize(packet);
+                            await writer.WriteLineAsync(json.AsMemory(), stoppingToken);
+                        }
+                        else if (line.StartsWith("UPDATE_CONFIG:"))
+                        {
+                            string jsonPayload = line.Substring("UPDATE_CONFIG:".Length);
+                            var updateCmd = JsonSerializer.Deserialize<ConfigUpdateCommand>(jsonPayload);
+                            if (updateCmd != null)
                             {
-                                int baseline = GetBaselineSocketCount(pid);
-                                _pidConnectionCounts.AddOrUpdate(pid, baseline, (_, current) => current + baseline);
-                                _baselineInitialized.TryAdd(pid, true);
+                                ApplyConfigUpdate(updateCmd);
                             }
-
-                            int currentConnections = _pidConnectionCounts.GetOrAdd(pid, 0);
-                            string status = currentConnections < 500 ? "Healthy" : (currentConnections < _config.GlobalMaxTcpConnections ? "Elevated" : "LEAK");
-                            telemetryBatch.Add(new ProcessTelemetryItem { ServiceName = procName, Pid = pid, Connections = currentConnections, Status = status });
-                            TelemetryExporter.RecordHealthSnapshot(procName, pid, currentConnections);
-
-                            if (currentConnections >= _config.GlobalMaxTcpConnections && _config.GlobalMaxTcpConnections > 0)
-                            {
-                                _logger.LogWarning(">>> GLOBAL LEAK DETECTED: {proc} (PID {pid}) exceeded threshold ({count}/{max}) <<<",
-                                    procName, pid, currentConnections, _config.GlobalMaxTcpConnections);
-
-                                SyslogNotifier.SendAlert(_config.Syslog, procName, pid, currentConnections, _config.GlobalMaxTcpConnections, "Global process socket leak mitigated");
-                                ExecuteCommand("taskkill", $"/F /T /PID {pid}");
-                                RecordRestartEvent(procName, pid, $"Exceeded global {_config.GlobalMaxTcpConnections} socket threshold");
-
-                                _pidConnectionCounts.TryRemove(pid, out _);
-                                _baselineInitialized.TryRemove(pid, out _);
-                            }
+                            await writer.WriteLineAsync("OK".AsMemory(), stoppingToken);
                         }
                     }
-                    catch { }
+
+                    if (server.IsConnected)
+                    {
+                        server.Disconnect();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "IPC Named Pipe connection error.");
+                    await Task.Delay(250, stoppingToken);
                 }
             }
-
-            // Update cached in-memory packet for instant IPC broadcast
-            _latestPacket = new TelemetryPacket
+        }
+        private TelemetryPacket BuildTelemetryPacket()
+        {
+            var packet = new TelemetryPacket
             {
                 Timestamp = DateTime.UtcNow.ToString("o"),
-                GlobalMaxTcpConnections = _config.GlobalMaxTcpConnections,
-                Whitelist = new List<string>(_config.ProcessWhitelist),
-                Processes = telemetryBatch,
-                RecentRestarts = new List<string>(_recentRestarts)
+                GlobalMaxTcpConnections = _globalMaxTcpConnections,
+                RecentRestarts = _recentRestarts.Take(20).ToList()
             };
 
-            await Task.Delay(_config.WatchdogIntervalSeconds * 1000, stoppingToken);
-        }
-    }
+            lock (_whitelist)
+            {
+                packet.Whitelist = _whitelist.ToList();
+            }
 
-    private async Task StartNamedPipeServerAsync(CancellationToken stoppingToken)
-    {
-        while (!stoppingToken.IsCancellationRequested)
+            foreach (var kvp in _pidConnectionCounts)
+            {
+                string procName = "LightingService";
+                try
+                {
+                    var p = Process.GetProcessById(kvp.Key);
+                    procName = p.ProcessName;
+                }
+                catch { }
+
+                string status = kvp.Value < 500 ? "Healthy" : (kvp.Value < _globalMaxTcpConnections ? "Elevated" : "CRITICAL LEAK");
+                packet.Processes.Add(new ProcessTelemetryItem
+                {
+                    ServiceName = procName,
+                    Pid = kvp.Key,
+                    Connections = kvp.Value,
+                    Status = status
+                });
+            }
+
+            return packet;
+        }
+
+        private void ApplyConfigUpdate(ConfigUpdateCommand cmd)
+        {
+            if (cmd.NewGlobalThreshold.HasValue && cmd.NewGlobalThreshold.Value >= 500)
+            {
+                _globalMaxTcpConnections = cmd.NewGlobalThreshold.Value;
+                _logger.LogInformation("IPC: Updated global threshold to {val}", _globalMaxTcpConnections);
+            }
+
+            lock (_whitelist)
+            {
+                if (!string.IsNullOrWhiteSpace(cmd.AddWhitelist))
+                {
+                    _whitelist.Add(cmd.AddWhitelist.Trim());
+                    _logger.LogInformation("IPC: Added {name} to whitelist.", cmd.AddWhitelist);
+                }
+                if (!string.IsNullOrWhiteSpace(cmd.RemoveWhitelist))
+                {
+                    _whitelist.Remove(cmd.RemoveWhitelist.Trim());
+                    _logger.LogInformation("IPC: Removed {name} from whitelist.", cmd.RemoveWhitelist);
+                }
+            }
+        }
+
+        private int GetBaselineSocketCount(int processId)
         {
             try
             {
-                using var pipeServer = new NamedPipeServerStream(
-                    "NetworkWatchdogPipe",
-                    PipeDirection.InOut,
-                    NamedPipeServerStream.MaxAllowedServerInstances,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous);
-
-                await pipeServer.WaitForConnectionAsync(stoppingToken);
-
-                using var reader = new StreamReader(pipeServer, Encoding.UTF8, leaveOpen: true);
-                using var writer = new StreamWriter(pipeServer, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
-
-                string? line = await reader.ReadLineAsync(stoppingToken);
-                if (line == "GET_TELEMETRY")
+                var psi = new ProcessStartInfo
                 {
-                    string json = JsonSerializer.Serialize(_latestPacket);
-                    await writer.WriteLineAsync(json.AsMemory(), stoppingToken);
-                }
-                else if (line?.StartsWith("UPDATE_CONFIG:") == true)
-                {
-                    string cmdJson = line["UPDATE_CONFIG:".Length..];
-                    var cmd = JsonSerializer.Deserialize<ConfigUpdateCommand>(cmdJson);
-                    if (cmd != null)
-                    {
-                        if (cmd.NewGlobalThreshold.HasValue && cmd.NewGlobalThreshold > 0)
-                        {
-                            _config.GlobalMaxTcpConnections = cmd.NewGlobalThreshold.Value;
-                        }
-                        if (!string.IsNullOrWhiteSpace(cmd.AddWhitelist) && !_config.ProcessWhitelist.Contains(cmd.AddWhitelist, StringComparer.OrdinalIgnoreCase))
-                        {
-                            _config.ProcessWhitelist.Add(cmd.AddWhitelist.Trim());
-                        }
-                        if (!string.IsNullOrWhiteSpace(cmd.RemoveWhitelist))
-                        {
-                            _config.ProcessWhitelist.RemoveAll(x => x.Equals(cmd.RemoveWhitelist.Trim(), StringComparison.OrdinalIgnoreCase));
-                        }
-                    }
-                    await writer.WriteLineAsync("OK".AsMemory(), stoppingToken);
-                }
+                    FileName = "powershell",
+                    Arguments = $"-NoProfile -Command \"(Get-NetTCPConnection -OwningProcess {processId} -ErrorAction SilentlyContinue).Count\"",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi);
+                if (proc == null) return 0;
+
+                string output = proc.StandardOutput.ReadToEnd().Trim();
+                return int.TryParse(output, out int count) ? count : 0;
             }
-            catch when (stoppingToken.IsCancellationRequested)
+            catch (Exception ex)
             {
-                break;
-            }
-            catch
-            {
-                await Task.Delay(500, stoppingToken);
+                _logger.LogError(ex, "Failed to get baseline socket count for PID {pid}", processId);
+                return 0;
             }
         }
-    }
 
-    private void RecordRestartEvent(string serviceName, int pid, string reason)
-    {
-        string entry = $"{DateTime.UtcNow:o},{serviceName},{pid},{reason}";
-        _recentRestarts.Insert(0, entry);
-        if (_recentRestarts.Count > 100) _recentRestarts.RemoveAt(_recentRestarts.Count - 1);
-        TelemetryExporter.RecordRestart(serviceName, pid, reason);
-    }
-
-    private int GetBaselineSocketCount(int processId)
-    {
-        try
+        private void StartEtwSession(CancellationToken stoppingToken)
         {
-            var psi = new ProcessStartInfo
+            if (!(TraceEventSession.IsElevated() ?? false))
             {
-                FileName = "powershell",
-                Arguments = $"-NoProfile -Command \"(Get-NetTCPConnection -OwningProcess {processId} -ErrorAction SilentlyContinue).Count\"",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using var proc = Process.Start(psi);
-            if (proc == null) return 0;
-            string output = proc.StandardOutput.ReadToEnd().Trim();
-            return int.TryParse(output, out int count) ? count : 0;
-        }
-        catch
-        {
-            return 0;
-        }
-    }
+                _logger.LogCritical("ETW Tracing requires Administrator privileges.");
+                return;
+            }
 
-    private void StartEtwSession(CancellationToken stoppingToken)
-    {
-        if (!(TraceEventSession.IsElevated() ?? false)) return;
+            if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
+            {
+                using var oldSession = new TraceEventSession("LightingWatchdogSession");
+                oldSession.Stop();
+            }
 
-        if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
-        {
-            using var oldSession = new TraceEventSession("LightingWatchdogSession");
-            oldSession.Stop();
+            using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
+            {
+                stoppingToken.Register(() => _etwSession?.Dispose());
+
+                _etwSession.Source.Dynamic.All += HandleAfdEvent;
+                _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
+                _etwSession.Source.Process();
+            }
         }
 
-        _etwSession = new TraceEventSession("LightingWatchdogSession");
-        stoppingToken.Register(() => { _etwSession?.Stop(); _etwSession?.Dispose(); });
-        _etwSession.Source.Dynamic.All += HandleAfdEvent;
-        _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-
-        Task.Run(() =>
+        private void HandleAfdEvent(TraceEvent data)
         {
-            try { _etwSession.Source.Process(); } catch { }
-        }, stoppingToken);
-    }
+            if (data.ProcessID == 0 || !_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
 
-    private void HandleAfdEvent(TraceEvent data)
-    {
-        if (data.ProcessID == 0) return;
-
-        if (!_pidConnectionCounts.ContainsKey(data.ProcessID) && _config.MonitorAllProcesses)
-        {
-            _pidConnectionCounts.TryAdd(data.ProcessID, 0);
-            _baselineInitialized.TryAdd(data.ProcessID, true);
+            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
+            {
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
+            }
+            else if (data.EventName.Contains("AfdClose"))
+            {
+                _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
+            }
         }
 
-        if (!_pidConnectionCounts.ContainsKey(data.ProcessID)) return;
-
-        if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
+        private void RestartLeakingService(string serviceName, int processId, int socketCount)
         {
-            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
-        }
-        else if (data.EventName.Contains("AfdClose"))
-        {
-            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
-        }
-    }
+            _logger.LogWarning("Stopping service {serviceName}...", serviceName);
+            ExecuteCommand("sc", $"stop {serviceName}");
 
-    private void HandleServiceRecovery(MonitoredService target, List<int> pids)
-    {
-        if (!target.EnableRestart) return;
+            _logger.LogWarning("Force killing PID {pid}...", processId);
+            ExecuteCommand("taskkill", $"/F /T /PID {processId}");
 
-        if (_lastRestartTimes.TryGetValue(target.ServiceName, out var lastRestart))
-        {
-            if ((DateTime.UtcNow - lastRestart).TotalMinutes < _config.CooldownSeconds) return;
+            _recentRestarts.Add($"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss},{serviceName},{processId},Exceeded {socketCount} sockets");
+
+            Thread.Sleep(15000);
+
+            ExecuteCommand("sc", $"start {serviceName}");
+
+            _pidConnectionCounts.TryRemove(processId, out _);
+            _baselineInitialized.TryRemove(processId, out _);
         }
 
-        RecordRestartEvent(target.ServiceName, pids.FirstOrDefault(), $"Exceeded {target.MaxTcpConnections} socket threshold");
-
-        foreach (var pid in pids)
-        {
-            ExecuteCommand("taskkill", $"/F /T /PID {pid}");
-        }
-
-        if (OperatingSystem.IsWindows())
+        private void ExecuteCommand(string filename, string arguments)
         {
             try
             {
-                using var sc = new ServiceController(target.ServiceName);
-                if (sc.Status == ServiceControllerStatus.Running || sc.Status == ServiceControllerStatus.Paused)
-                {
-                    sc.Stop();
-                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(10));
-                }
-                sc.Start();
+                var psi = new ProcessStartInfo { FileName = filename, Arguments = arguments, UseShellExecute = false, CreateNoWindow = true };
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit();
             }
-            catch { }
-        }
-
-        _lastRestartTimes[target.ServiceName] = DateTime.UtcNow;
-
-        foreach (var pid in pids)
-        {
-            _pidConnectionCounts.TryRemove(pid, out _);
-            _baselineInitialized.TryRemove(pid, out _);
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Command failed: {filename} {arguments}", filename, arguments);
+            }
         }
     }
 
-    private void ExecuteCommand(string filename, string arguments)
-    {
-        try
-        {
-            var psi = new ProcessStartInfo { FileName = filename, Arguments = arguments, UseShellExecute = false, CreateNoWindow = true };
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit();
-        }
-        catch { }
-    }
+    public class TelemetryPacket
+{
+    public string Timestamp { get; set; } = string.Empty;
+    public int GlobalMaxTcpConnections { get; set; }
+    public List<string> Whitelist { get; set; } = new();
+    public List<ProcessTelemetryItem> Processes { get; set; } = new();
+    public List<string> RecentRestarts { get; set; } = new();
+}
+
+public class ProcessTelemetryItem
+{
+    public string ServiceName { get; set; } = string.Empty;
+    public int Pid { get; set; }
+    public int Connections { get; set; }
+    public string Status { get; set; } = string.Empty;
+}
+
+public class ConfigUpdateCommand
+{
+    public int? NewGlobalThreshold { get; set; }
+    public string? AddWhitelist { get; set; }
+    public string? RemoveWhitelist { get; set; }
+}
 }
