@@ -4,6 +4,13 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Resolved `CS0649` compiler warning in `NetworkWatchdog.TrayApp` by properly assigning `_csvHealthPath` inline for fallback telemetry polling.
+- Removed obsolete unused restart CSV fields from the Tray Application context.
+
 ## [3.4.0] - 2026-09-24
 
 ### Added
