@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.ServiceProcess;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Extensions.Options;
@@ -17,6 +20,8 @@ public class Worker : BackgroundService
     private readonly ConcurrentDictionary<int, int> _pidConnectionCounts = new();
     private readonly ConcurrentDictionary<int, bool> _baselineInitialized = new();
     private readonly Dictionary<string, DateTime> _lastRestartTimes = new();
+    private readonly List<string> _recentRestarts = new();
+    private TelemetryPacket _latestPacket = new();
 
     public Worker(ILogger<Worker> logger, IOptions<WatchdogConfig> config)
     {
@@ -26,11 +31,14 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Starting AFD Kernel Tracing Session...");
+        _logger.LogInformation("Starting AFD Kernel Tracing Session and IPC Pipe Server...");
         StartEtwSession(stoppingToken);
+        _ = StartNamedPipeServerAsync(stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            var telemetryBatch = new List<ProcessTelemetryItem>();
+
             // 1. Evaluate Explicitly Monitored Services
             foreach (var target in _config.MonitoredServices)
             {
@@ -48,29 +56,28 @@ public class Worker : BackgroundService
                             int baseline = GetBaselineSocketCount(proc.Id);
                             _pidConnectionCounts.AddOrUpdate(proc.Id, baseline, (_, current) => current + baseline);
                             _baselineInitialized.TryAdd(proc.Id, true);
-                            _logger.LogInformation("[PID {pid}] Baseline initialized with {baseline} pre-existing handles for {process}.", proc.Id, baseline, processName);
                         }
 
                         int currentConnections = _pidConnectionCounts.GetOrAdd(proc.Id, 0);
                         totalConnectionsForService += currentConnections;
 
+                        string status = currentConnections < 500 ? "Healthy" : (currentConnections < target.MaxTcpConnections ? "Elevated" : "LEAK");
+                        telemetryBatch.Add(new ProcessTelemetryItem { ServiceName = processName, Pid = proc.Id, Connections = currentConnections, Status = status });
                         TelemetryExporter.RecordHealthSnapshot(processName, proc.Id, currentConnections);
                     }
                 }
 
-                _logger.LogInformation("[{service}] Total TCP Connections: {tcpCount} / {max}", 
-                    target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
-
                 if (totalConnectionsForService >= target.MaxTcpConnections && target.MaxTcpConnections > 0)
                 {
-                    _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<", 
+                    _logger.LogWarning(">>> LEAK DETECTED: {service} exceeded threshold ({count}/{max}) <<<",
                         target.ServiceName, totalConnectionsForService, target.MaxTcpConnections);
 
+                    SyslogNotifier.SendAlert(_config.Syslog, target.ServiceName, targetPids.FirstOrDefault(), totalConnectionsForService, target.MaxTcpConnections, "Service leak threshold breached");
                     HandleServiceRecovery(target, targetPids);
                 }
             }
 
-            // 2. Universal Process Monitoring (If Enabled)
+            // 2. Universal Process Monitoring
             if (_config.MonitorAllProcesses)
             {
                 foreach (var proc in Process.GetProcesses())
@@ -78,11 +85,12 @@ public class Worker : BackgroundService
                     try
                     {
                         int pid = proc.Id;
-                        if (pid <= 4) continue; // Skip System idle/kernel
+                        if (pid <= 4) continue;
 
                         string procName = proc.ProcessName;
-                        bool isExplicitlyMonitored = _config.MonitoredServices.Any(s => s.ProcessTree.Contains(procName, StringComparer.OrdinalIgnoreCase));
+                        if (_config.ProcessWhitelist.Contains(procName, StringComparer.OrdinalIgnoreCase)) continue;
 
+                        bool isExplicitlyMonitored = _config.MonitoredServices.Any(s => s.ProcessTree.Contains(procName, StringComparer.OrdinalIgnoreCase));
                         if (!isExplicitlyMonitored)
                         {
                             if (!_baselineInitialized.ContainsKey(pid))
@@ -93,30 +101,105 @@ public class Worker : BackgroundService
                             }
 
                             int currentConnections = _pidConnectionCounts.GetOrAdd(pid, 0);
+                            string status = currentConnections < 500 ? "Healthy" : (currentConnections < _config.GlobalMaxTcpConnections ? "Elevated" : "LEAK");
+                            telemetryBatch.Add(new ProcessTelemetryItem { ServiceName = procName, Pid = pid, Connections = currentConnections, Status = status });
                             TelemetryExporter.RecordHealthSnapshot(procName, pid, currentConnections);
 
                             if (currentConnections >= _config.GlobalMaxTcpConnections && _config.GlobalMaxTcpConnections > 0)
                             {
-                                _logger.LogWarning(">>> GLOBAL LEAK DETECTED: Process {proc} (PID {pid}) exceeded global threshold ({count}/{max}) <<<",
+                                _logger.LogWarning(">>> GLOBAL LEAK DETECTED: {proc} (PID {pid}) exceeded threshold ({count}/{max}) <<<",
                                     procName, pid, currentConnections, _config.GlobalMaxTcpConnections);
 
+                                SyslogNotifier.SendAlert(_config.Syslog, procName, pid, currentConnections, _config.GlobalMaxTcpConnections, "Global process socket leak mitigated");
                                 ExecuteCommand("taskkill", $"/F /T /PID {pid}");
-                                TelemetryExporter.RecordRestart(procName, pid, $"Exceeded global {_config.GlobalMaxTcpConnections} socket threshold");
-                                
+                                RecordRestartEvent(procName, pid, $"Exceeded global {_config.GlobalMaxTcpConnections} socket threshold");
+
                                 _pidConnectionCounts.TryRemove(pid, out _);
                                 _baselineInitialized.TryRemove(pid, out _);
                             }
                         }
                     }
-                    catch
-                    {
-                        // Handle race conditions where process exits during iteration
-                    }
+                    catch { }
                 }
             }
 
+            // Update cached in-memory packet for instant IPC broadcast
+            _latestPacket = new TelemetryPacket
+            {
+                Timestamp = DateTime.UtcNow.ToString("o"),
+                GlobalMaxTcpConnections = _config.GlobalMaxTcpConnections,
+                Whitelist = new List<string>(_config.ProcessWhitelist),
+                Processes = telemetryBatch,
+                RecentRestarts = new List<string>(_recentRestarts)
+            };
+
             await Task.Delay(_config.WatchdogIntervalSeconds * 1000, stoppingToken);
         }
+    }
+
+    private async Task StartNamedPipeServerAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var pipeServer = new NamedPipeServerStream(
+                    "NetworkWatchdogPipe",
+                    PipeDirection.InOut,
+                    NamedPipeServerStream.MaxAllowedServerInstances,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous);
+
+                await pipeServer.WaitForConnectionAsync(stoppingToken);
+
+                using var reader = new StreamReader(pipeServer, Encoding.UTF8, leaveOpen: true);
+                using var writer = new StreamWriter(pipeServer, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+
+                string? line = await reader.ReadLineAsync(stoppingToken);
+                if (line == "GET_TELEMETRY")
+                {
+                    string json = JsonSerializer.Serialize(_latestPacket);
+                    await writer.WriteLineAsync(json.AsMemory(), stoppingToken);
+                }
+                else if (line?.StartsWith("UPDATE_CONFIG:") == true)
+                {
+                    string cmdJson = line["UPDATE_CONFIG:".Length..];
+                    var cmd = JsonSerializer.Deserialize<ConfigUpdateCommand>(cmdJson);
+                    if (cmd != null)
+                    {
+                        if (cmd.NewGlobalThreshold.HasValue && cmd.NewGlobalThreshold > 0)
+                        {
+                            _config.GlobalMaxTcpConnections = cmd.NewGlobalThreshold.Value;
+                        }
+                        if (!string.IsNullOrWhiteSpace(cmd.AddWhitelist) && !_config.ProcessWhitelist.Contains(cmd.AddWhitelist, StringComparer.OrdinalIgnoreCase))
+                        {
+                            _config.ProcessWhitelist.Add(cmd.AddWhitelist.Trim());
+                        }
+                        if (!string.IsNullOrWhiteSpace(cmd.RemoveWhitelist))
+                        {
+                            _config.ProcessWhitelist.RemoveAll(x => x.Equals(cmd.RemoveWhitelist.Trim(), StringComparison.OrdinalIgnoreCase));
+                        }
+                    }
+                    await writer.WriteLineAsync("OK".AsMemory(), stoppingToken);
+                }
+            }
+            catch when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch
+            {
+                await Task.Delay(500, stoppingToken);
+            }
+        }
+    }
+
+    private void RecordRestartEvent(string serviceName, int pid, string reason)
+    {
+        string entry = $"{DateTime.UtcNow:o},{serviceName},{pid},{reason}";
+        _recentRestarts.Insert(0, entry);
+        if (_recentRestarts.Count > 100) _recentRestarts.RemoveAt(_recentRestarts.Count - 1);
+        TelemetryExporter.RecordRestart(serviceName, pid, reason);
     }
 
     private int GetBaselineSocketCount(int processId)
@@ -131,31 +214,20 @@ public class Worker : BackgroundService
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-
             using var proc = Process.Start(psi);
             if (proc == null) return 0;
-
             string output = proc.StandardOutput.ReadToEnd().Trim();
-            if (int.TryParse(output, out int count))
-            {
-                return count;
-            }
-            return 0;
+            return int.TryParse(output, out int count) ? count : 0;
         }
-        catch (Exception ex)
+        catch
         {
-            _logger.LogError(ex, "Failed to get baseline socket count for PID {pid}", processId);
             return 0;
         }
     }
 
     private void StartEtwSession(CancellationToken stoppingToken)
     {
-        if (!(TraceEventSession.IsElevated() ?? false))
-        {
-            _logger.LogCritical("ETW Tracing requires Administrator privileges.");
-            return;
-        }
+        if (!(TraceEventSession.IsElevated() ?? false)) return;
 
         if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
         {
@@ -164,26 +236,13 @@ public class Worker : BackgroundService
         }
 
         _etwSession = new TraceEventSession("LightingWatchdogSession");
-
-        stoppingToken.Register(() => 
-        {
-            _etwSession?.Stop();
-            _etwSession?.Dispose();
-        });
-
+        stoppingToken.Register(() => { _etwSession?.Stop(); _etwSession?.Dispose(); });
         _etwSession.Source.Dynamic.All += HandleAfdEvent;
         _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
 
         Task.Run(() =>
         {
-            try
-            {
-                _etwSession.Source.Process();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "ETW session processing encountered an error.");
-            }
+            try { _etwSession.Source.Process(); } catch { }
         }, stoppingToken);
     }
 
@@ -191,7 +250,6 @@ public class Worker : BackgroundService
     {
         if (data.ProcessID == 0) return;
 
-        // Automatically track PIDs if universal monitoring is enabled, or if already initialized
         if (!_pidConnectionCounts.ContainsKey(data.ProcessID) && _config.MonitorAllProcesses)
         {
             _pidConnectionCounts.TryAdd(data.ProcessID, 0);
@@ -202,11 +260,11 @@ public class Worker : BackgroundService
 
         if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
         {
-            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (pid, count) => count + 1);
+            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 1, (_, count) => count + 1);
         }
         else if (data.EventName.Contains("AfdClose"))
         {
-            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (pid, count) => Math.Max(0, count - 1));
+            _pidConnectionCounts.AddOrUpdate(data.ProcessID, 0, (_, count) => Math.Max(0, count - 1));
         }
     }
 
@@ -216,16 +274,10 @@ public class Worker : BackgroundService
 
         if (_lastRestartTimes.TryGetValue(target.ServiceName, out var lastRestart))
         {
-            if ((DateTime.UtcNow - lastRestart).TotalMinutes < _config.CooldownSeconds)
-            {
-                _logger.LogInformation("Service {service} is in cooldown period. Skipping restart.", target.ServiceName);
-                return;
-            }
+            if ((DateTime.UtcNow - lastRestart).TotalMinutes < _config.CooldownSeconds) return;
         }
 
-        TelemetryExporter.RecordRestart(target.ServiceName, pids.FirstOrDefault(), $"Exceeded {target.MaxTcpConnections} socket threshold");
-
-        _logger.LogWarning("Initiating recovery sequence for {service}...", target.ServiceName);
+        RecordRestartEvent(target.ServiceName, pids.FirstOrDefault(), $"Exceeded {target.MaxTcpConnections} socket threshold");
 
         foreach (var pid in pids)
         {
@@ -243,16 +295,8 @@ public class Worker : BackgroundService
                     sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(10));
                 }
                 sc.Start();
-                _logger.LogInformation("Successfully restarted Windows Service: {service}", target.ServiceName);
             }
-            catch (Exception)
-            {
-                _logger.LogInformation("Windows Service control skipped or failed for {service}. Relying on process tree termination.", target.ServiceName);
-            }
-        }
-        else
-        {
-            _logger.LogInformation("Windows Service control is unavailable on this platform for {service}. Relying on process tree termination.", target.ServiceName);
+            catch { }
         }
 
         _lastRestartTimes[target.ServiceName] = DateTime.UtcNow;
@@ -268,19 +312,10 @@ public class Worker : BackgroundService
     {
         try
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = filename,
-                Arguments = arguments,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            var psi = new ProcessStartInfo { FileName = filename, Arguments = arguments, UseShellExecute = false, CreateNoWindow = true };
             using var proc = Process.Start(psi);
             proc?.WaitForExit();
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Command failed: {filename} {arguments}", filename, arguments);
-        }
+        catch { }
     }
 }

@@ -4,6 +4,24 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.4.0] - 2026-09-24
+
+### Added
+
+- Implemented an asynchronous Named Pipe IPC server (`NetworkWatchdogPipe`) in `Worker.cs` for sub-millisecond, zero-disk I/O telemetry streaming.
+- Updated `NetworkWatchdog.TrayApp` to consume live telemetry directly via Named Pipes with transparent CSV file fallback.
+- Added a "Settings & Whitelist" tab to `DashboardForm` featuring a real-time `GlobalMaxTcpConnections` threshold slider and dynamic process whitelisting.
+- Implemented `SyslogNotifier.cs` to forward socket breach and mitigation alerts via UDP to remote syslog hosts or container instances.
+
+## [3.3.0] - 2026-09-24
+
+### Added
+
+- Created an interactive Windows Forms telemetry dashboard (`DashboardForm`) accessible via tray icon double-click or the "Open Dashboard" context menu.
+- Integrated a live data grid displaying monitored processes, PIDs, active connection counts, and status indicators.
+- Added a "Terminate Process Tree" action button and dynamic context-menu item for manual kill actions.
+- Added a dedicated "Historical Mitigations" tab parsing `RestartEvents_v2.csv` directly in the UI.
+
 ## [3.2.0] - 2026-09-24
 
 ### Added

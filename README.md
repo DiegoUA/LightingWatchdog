@@ -33,6 +33,7 @@ LightingWatchdog/
     │   │   ├── appsettings.json
     │   │   ├── NetworkWatchdogService.csproj
     │   │   ├── Program.cs
+    │   │   ├── SyslogNotifier.cs
     │   │   ├── TelemetryExporter.cs
     │   │   └── Worker.cs
     │   └── NetworkWatchdog.TrayApp/
