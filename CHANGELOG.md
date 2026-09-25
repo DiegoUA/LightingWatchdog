@@ -4,6 +4,23 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.4.2] - 2026-09-26
+
+### Fixed
+
+- **Critical Fix:** Resolved a severe unmanaged GDI memory leak in `NetworkWatchdog.TrayApp` that caused fatal `Exit Code 1` crashes after ~2 hours of continuous operation due to Win32 USER handle exhaustion.
+- Transitioned TrayApp from generating `Bitmap.GetHicon()` dynamically per-tick to caching UI colors and fonts at startup.
+- Implemented `user32.dll DestroyIcon` P/Invoke to enforce strict memory teardown of `HICON` pointers.
+- Enforced deterministic `.Dispose()` garbage collection on `ContextMenuStrip` structures during UI repaints.
+
+### Security & Resilience
+
+- **Handle Hygiene:** Integrated `user32.dll GetGuiResources` P/Invoke to enforce a strict 200-handle guardrail (`GR_GDIOBJECTS` / `GR_USEROBJECTS`), logging diagnostic warnings before Windows subsystem limits are breached.
+- **Named Pipe Resiliency:** Enforced strict 1,000ms and 500ms connection timeouts on all `NamedPipeClientStream` requests to prevent UI thread lockups and orphaned handles.
+- **Crash Resilience:** Wired `AppDomain.CurrentDomain.UnhandledException` and `TaskScheduler.UnobservedTaskException` to a global `LogFatalError` handler, capturing complete stack traces to `tray_crash.log` instead of failing with silent exit codes.
+- **Anti-Tampering (CLI):** Replaced vulnerable string concatenation in `taskkill` invocations with `ProcessStartInfo.ArgumentList` to completely eliminate parameter injection vectors.
+- **Payload Validation:** Clamped the global threshold slider rigidly between 200 and 10,000 via `Math.Clamp`, and enforced strict Regex (`^[a-zA-Z0-9_\-\.]+$`) on process whitelisting to block path traversal and shell-escape characters.
+
 ## [3.4.1] - 2026-09-24
 
 ### Added

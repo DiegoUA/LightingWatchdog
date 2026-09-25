@@ -26,7 +26,7 @@ Desktop.ini
 *.suo
 
 # Gemini *.md files
-*.gemini
+.gemini/
 
 #.markdownlint.yaml instructions
 .markdownlint.yaml

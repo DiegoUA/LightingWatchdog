@@ -5,8 +5,10 @@ using System.Drawing;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace NetworkWatchdog.TrayApp
@@ -16,29 +18,76 @@ namespace NetworkWatchdog.TrayApp
         [STAThread]
         public static void Main()
         {
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                LogFatalError(e.ExceptionObject as Exception, "AppDomain.UnhandledException");
+            };
+
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                LogFatalError(e.Exception, "TaskScheduler.UnobservedTaskException");
+                e.SetObserved();
+            };
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new TrayApplicationContext());
+        }
+
+        public static void LogFatalError(Exception? ex, string source = "Unknown")
+        {
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tray_crash.log");
+                File.AppendAllText(logPath, $"[{DateTime.UtcNow:o}] [{source}] FATAL: {ex?.ToString()}{Environment.NewLine}");
+            }
+            catch { }
         }
     }
 
     public class TrayApplicationContext : ApplicationContext
     {
+        private const int GR_GDIOBJECTS = 0;
+        private const int GR_USEROBJECTS = 1;
+
+        [DllImport("user32.dll")]
+        private static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool DestroyIcon(IntPtr handle);
+
         private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _timer;
-        private readonly string _csvHealthPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\HealthTrend_v2.csv";
+        private readonly string _csvHealthPath;
         private bool _isSilentMode = false;
         private string _lastRestartEvent = string.Empty;
         private DashboardForm? _dashboardForm;
 
+        // Cached GDI resources to prevent handle exhaustion
+        private readonly Icon _iconGreen;
+        private readonly Icon _iconOrange;
+        private readonly Icon _iconRed;
+        private readonly Icon _iconGray;
+        private readonly Font _boldFont;
+
         public TrayApplicationContext()
         {
+            _csvHealthPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "bin", "Release", "logs", "export", "HealthTrend_v2.csv");
+
+            // Generate GDI icons exactly once
+            _iconGreen = GenerateCachedIcon(Color.Green);
+            _iconOrange = GenerateCachedIcon(Color.Orange);
+            _iconRed = GenerateCachedIcon(Color.Red);
+            _iconGray = GenerateCachedIcon(Color.Gray);
+            _boldFont = new Font(Control.DefaultFont, FontStyle.Bold);
+
             _trayIcon = new NotifyIcon
             {
-                Icon = CreateSolidIcon(Color.Gray),
+                Icon = _iconGray,
                 Text = "NetworkWatchdog: Initializing IPC...",
-                Visible = true,
-                ContextMenuStrip = new ContextMenuStrip()
+                Visible = true
             };
 
             _trayIcon.DoubleClick += (s, e) => ShowDashboard();
@@ -49,12 +98,28 @@ namespace NetworkWatchdog.TrayApp
             _timer.Start();
         }
 
+        private Icon GenerateCachedIcon(Color color)
+        {
+            using var bitmap = new Bitmap(16, 16);
+            using var g = Graphics.FromImage(bitmap);
+            using var brush = new SolidBrush(color);
+            g.FillEllipse(brush, 0, 0, 16, 16);
+
+            IntPtr hIcon = bitmap.GetHicon();
+            using var tempIcon = Icon.FromHandle(hIcon);
+            var finalIcon = (Icon)tempIcon.Clone();
+            DestroyIcon(hIcon);
+            return finalIcon;
+        }
+
         private void RebuildContextMenu(List<ProcessTelemetryItem> elevated)
         {
+            var oldMenu = _trayIcon.ContextMenuStrip;
             var menu = new ContextMenuStrip();
+
             var openDash = new ToolStripMenuItem("Open Dashboard", null, (s, e) => ShowDashboard())
             {
-                Font = new Font(Control.DefaultFont, FontStyle.Bold)
+                Font = _boldFont
             };
             menu.Items.Add(openDash);
 
@@ -62,8 +127,7 @@ namespace NetworkWatchdog.TrayApp
             {
                 _isSilentMode = !_isSilentMode;
                 ((ToolStripMenuItem)s!).Checked = _isSilentMode;
-            })
-            { Checked = _isSilentMode };
+            }) { Checked = _isSilentMode };
             menu.Items.Add(silent);
 
             if (elevated.Count > 0)
@@ -82,14 +146,42 @@ namespace NetworkWatchdog.TrayApp
 
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (s, e) => Exit());
+
             _trayIcon.ContextMenuStrip = menu;
+            oldMenu?.Dispose();
+        }
+
+        private void CheckHandleLimits()
+        {
+            try
+            {
+                IntPtr hProcess = Process.GetCurrentProcess().Handle;
+                uint gdiHandles = GetGuiResources(hProcess, GR_GDIOBJECTS);
+                uint userHandles = GetGuiResources(hProcess, GR_USEROBJECTS);
+
+                if (gdiHandles > 200 || userHandles > 200)
+                {
+                    string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tray_crash.log");
+                    File.AppendAllText(logPath, $"[{DateTime.UtcNow:o}] [WARN] Elevated Win32 Handles: GDI={gdiHandles}, USER={userHandles}. Threshold=200.{Environment.NewLine}");
+                }
+            }
+            catch { }
         }
 
         private void KillProcessTree(int pid, string name)
         {
             try
             {
-                var psi = new ProcessStartInfo { FileName = "taskkill", Arguments = $"/F /T /PID {pid}", UseShellExecute = false, CreateNoWindow = true };
+                var psi = new ProcessStartInfo("taskkill.exe")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("/F");
+                psi.ArgumentList.Add("/T");
+                psi.ArgumentList.Add("/PID");
+                psi.ArgumentList.Add(pid.ToString());
+
                 using var proc = Process.Start(psi);
                 proc?.WaitForExit();
                 _trayIcon.ShowBalloonTip(3000, "Process Terminated", $"Terminated {name} (PID {pid}).", ToolTipIcon.Warning);
@@ -113,6 +205,8 @@ namespace NetworkWatchdog.TrayApp
 
         private void PollTelemetry()
         {
+            CheckHandleLimits();
+
             TelemetryPacket? packet = QueryNamedPipe();
 
             if (packet != null && packet.Processes.Count > 0)
@@ -142,10 +236,7 @@ namespace NetworkWatchdog.TrayApp
                     return JsonSerializer.Deserialize<TelemetryPacket>(response);
                 }
             }
-            catch (Exception)
-            {
-                // Silently fallback to CSV polling if pipe handshake drops
-            }
+            catch { }
             return null;
         }
 
@@ -154,7 +245,7 @@ namespace NetworkWatchdog.TrayApp
             try
             {
                 using var pipeClient = new NamedPipeClientStream(".", "NetworkWatchdogPipe", PipeDirection.InOut);
-                pipeClient.Connect(300);
+                pipeClient.Connect(500);
 
                 using var reader = new StreamReader(pipeClient, Encoding.UTF8);
                 using var writer = new StreamWriter(pipeClient, Encoding.UTF8) { AutoFlush = true };
@@ -175,10 +266,10 @@ namespace NetworkWatchdog.TrayApp
             RebuildContextMenu(elevated);
 
             var worst = packet.Processes.OrderByDescending(p => p.Connections).First();
-            Color color = worst.Connections < 500 ? Color.Green : (worst.Connections < 1000 ? Color.Orange : Color.Red);
+            Icon targetIcon = worst.Connections < 500 ? _iconGreen : (worst.Connections < 1000 ? _iconOrange : _iconRed);
             string status = worst.Connections < 500 ? "Healthy" : (worst.Connections < 1000 ? "Elevated" : "CRITICAL LEAK");
 
-            _trayIcon.Icon = CreateSolidIcon(color);
+            _trayIcon.Icon = targetIcon;
             _trayIcon.Text = $"NetworkWatchdog [{status}]\nTop: {worst.ServiceName} (PID {worst.Pid}): {worst.Connections} sockets\nIPC Streaming Active";
 
             if (packet.RecentRestarts.Count > 0)
@@ -215,26 +306,23 @@ namespace NetworkWatchdog.TrayApp
                 var parts = lastLine.Split(',');
                 if (parts.Length >= 4 && int.TryParse(parts[3], out int conn))
                 {
-                    _trayIcon.Icon = CreateSolidIcon(conn < 500 ? Color.Green : (conn < 1000 ? Color.Orange : Color.Red));
+                    _trayIcon.Icon = conn < 500 ? _iconGreen : (conn < 1000 ? _iconOrange : _iconRed);
                     _trayIcon.Text = $"NetworkWatchdog [File Fallback]\n{parts[1]} (PID {parts[2]}): {conn} sockets";
                 }
             }
             catch { }
         }
 
-        private Icon CreateSolidIcon(Color color)
-        {
-            using var bitmap = new Bitmap(16, 16);
-            using var g = Graphics.FromImage(bitmap);
-            using var brush = new SolidBrush(color);
-            g.FillEllipse(brush, 0, 0, 16, 16);
-            return Icon.FromHandle(bitmap.GetHicon());
-        }
-
         private void Exit()
         {
             _timer.Stop();
             _trayIcon.Visible = false;
+            _trayIcon.Dispose();
+            _iconGreen.Dispose();
+            _iconOrange.Dispose();
+            _iconRed.Dispose();
+            _iconGray.Dispose();
+            _boldFont.Dispose();
             _dashboardForm?.Close();
             Application.Exit();
         }
@@ -262,7 +350,6 @@ namespace NetworkWatchdog.TrayApp
 
             _tabs = new TabControl { Dock = DockStyle.Fill };
 
-            // Tab 1: Live Monitor
             var tabProcesses = new TabPage("Live Processes (IPC)");
             _gridProcesses = new DataGridView { Dock = DockStyle.Fill, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, ReadOnly = true, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false };
             _gridProcesses.Columns.Add("ServiceName", "Process");
@@ -286,7 +373,6 @@ namespace NetworkWatchdog.TrayApp
             tabProcesses.Controls.Add(_gridProcesses);
             tabProcesses.Controls.Add(btnPanel);
 
-            // Tab 2: Historical Restarts
             var tabRestarts = new TabPage("Mitigation Logs");
             _gridRestarts = new DataGridView { Dock = DockStyle.Fill, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, ReadOnly = true };
             _gridRestarts.Columns.Add("Timestamp", "Timestamp");
@@ -295,17 +381,17 @@ namespace NetworkWatchdog.TrayApp
             _gridRestarts.Columns.Add("Reason", "Reason");
             tabRestarts.Controls.Add(_gridRestarts);
 
-            // Tab 3: Settings & Whitelisting
             var tabSettings = new TabPage("Settings & Whitelist");
             var pnlSettings = new Panel { Dock = DockStyle.Fill, Padding = new Padding(15) };
 
-            var lblThresh = new Label { Text = "Global Max TCP Connections Threshold:", Top = 15, Left = 15, Width = 300 };
-            _sliderThreshold = new TrackBar { Top = 40, Left = 15, Width = 400, Minimum = 500, Maximum = 5000, TickFrequency = 250, SmallChange = 50, LargeChange = 250 };
-            _lblSliderValue = new Label { Text = "1500", Top = 45, Left = 425, Width = 60 };
+            var lblThresh = new Label { Text = "Global Max TCP Connections Threshold (200 - 10000):", Top = 15, Left = 15, Width = 350 };
+            _sliderThreshold = new TrackBar { Top = 40, Left = 15, Width = 400, Minimum = 200, Maximum = 10000, TickFrequency = 500, SmallChange = 50, LargeChange = 250 };
+            _lblSliderValue = new Label { Text = "1000", Top = 45, Left = 425, Width = 60 };
             _sliderThreshold.ValueChanged += (s, e) =>
             {
-                _lblSliderValue.Text = _sliderThreshold.Value.ToString();
-                _sendConfigAction(new ConfigUpdateCommand { NewGlobalThreshold = _sliderThreshold.Value });
+                int val = Math.Clamp(_sliderThreshold.Value, 200, 10000);
+                _lblSliderValue.Text = val.ToString();
+                _sendConfigAction(new ConfigUpdateCommand { NewGlobalThreshold = val });
             };
 
             var lblWhite = new Label { Text = "Excluded / Whitelisted Processes (Bypass Auto-Kill):", Top = 90, Left = 15, Width = 350 };
@@ -316,7 +402,7 @@ namespace NetworkWatchdog.TrayApp
             btnAdd.Click += (s, e) =>
             {
                 string proc = txtNewItem.Text.Trim();
-                if (!string.IsNullOrEmpty(proc))
+                if (!string.IsNullOrEmpty(proc) && System.Text.RegularExpressions.Regex.IsMatch(proc, @"^[a-zA-Z0-9_\-\.]+$"))
                 {
                     _sendConfigAction(new ConfigUpdateCommand { AddWhitelist = proc });
                     _listWhitelist.Items.Add(proc);
@@ -360,7 +446,7 @@ namespace NetworkWatchdog.TrayApp
                 }
             }
 
-            if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum)
+            if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum && packet.GlobalMaxTcpConnections <= _sliderThreshold.Maximum)
             {
                 _sliderThreshold.Value = packet.GlobalMaxTcpConnections;
                 _lblSliderValue.Text = packet.GlobalMaxTcpConnections.ToString();

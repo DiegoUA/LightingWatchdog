@@ -1,6 +1,6 @@
-# LightingWatchdog
+# NetworkWatchdogService
 
-Advanced Windows network diagnostic and self-healing watchdog for ASUS LightingService leaks.
+Advanced Windows network diagnostic and self-healing watchdog for socket leaks, runaway connection storms, and kernel memory pressure. (Formerly LightingWatchdog).
 
 ---
 
@@ -47,7 +47,7 @@ LightingWatchdog/
 
 ## ⚙️ Description
 
-LightingWatchdog is a modular Windows diagnostic and watchdog system designed to detect and mitigate TCP/UDP socket leaks, runaway connection storms, nonpaged pool exhaustion, and kernel memory pressure.
+NetworkWatchdogService is a modular Windows diagnostic and watchdog system designed to detect and mitigate TCP/UDP socket leaks, runaway connection storms, nonpaged pool exhaustion, and kernel memory pressure across any system process.
 
 **Feature Milestones:**
 
@@ -58,11 +58,11 @@ LightingWatchdog is a modular Windows diagnostic and watchdog system designed to
 - **v3.1.x:** `NetworkWatchdog.TrayApp` graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
 - **v3.2.x:** Universal system-wide process monitoring (`MonitorAllProcesses`) and tray balloon alerts with a toggleable Silent Mode.
 - **v3.3.x:** Interactive Live Process Inspector Dashboard Form, context-menu manual process termination, and historical mitigation log viewer.
-- **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes (`NetworkWatchdogPipe`), runtime settings slider with whitelisting, and remote Syslog forwarding over UDP.
+- **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes (`NetworkWatchdogPipe`), runtime settings slider with whitelisting, UDP Syslog alert forwarding, GDI Handle hygiene guards, global unhandled exception capture, and CLI anti-tampering limits.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
-LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
+NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 
 1. **Initial Baseline:** Upon discovering a monitored or active process, the service executes a single, lightweight `netstat` snapshot to capture pre-existing socket leaks.
 2. **Zero-Overhead Tracking:** Ongoing monitoring integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `Microsoft-Windows-Winsock-AFD` provider, the service listens asynchronously to raw socket allocations in real-time, adding them to the baseline.
@@ -105,6 +105,7 @@ LightingWatchdog (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.3.0** | 2026‑09‑24 | Added interactive Windows Forms Dashboard Form (live process telemetry grid, manual process tree termination, and historical mitigation viewer). |
 | **v3.4.0** | 2026‑09‑24 | Added Named Pipe IPC streaming, runtime threshold slider with process whitelisting, and UDP Syslog alert forwarding. |
 | **v3.4.1** | 2026-09-24 | Fixed SCM service startup timeout via assembly bundling, resolved PipeSecurity cross-session IPC access, and fixed TrayApp fallback initialization. |
+| **v3.4.2** | 2026‑09‑26 | GDI/USER handle exhaustion hotfix, runtime UI caching, 200 Win32 handle monitoring guard, Named Pipe timeout resiliency, global unhandled exception trapping to tray_crash.log, payload regex clamping, and CLI argument injection defenses. |
 
 ## Key Features
 
