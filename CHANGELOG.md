@@ -4,6 +4,27 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.5.0] - 2026-09-28
+
+### Added
+
+- **Native OS Socket Synchronization:** Completely eliminated `netstat.exe` subprocess dependencies. `PeriodicResyncLoopAsync` now queries the Windows kernel directly via P/Invoke `GetExtendedTcpTable`, providing sub-millisecond, dead-lock-free socket baseline resolution to correct ETW telemetry drift.
+- **WMI Service Mapping:** Integrated Windows Management Instrumentation (WMI) to automatically map process IDs directly to their registered SCM service names (fixing `sc.exe` start failures on shared host processes like `svchost.exe`).
+- **LPE Target Boundary (Anti-Malware):** Introduced `IsTrustedExecutablePath` to secure the standalone executable auto-restart feature. If a leaking non-service executable originates from an unprivileged, user-writable directory (e.g., `AppData`), the Watchdog will kill the process to stop the leak but refuse to relaunch it, completely neutralizing Local Privilege Escalation (LPE) attacks.
+- **Log Bounding Limit:** Migrated the recent restart history tracker from a limitless `ConcurrentBag` to a capped `ConcurrentQueue`, automatically dequeuing events older than 50 iterations to prevent long-term memory leaks.
+- **Cascade Restart Guards:** Added an atomic `_activeRestarts` dictionary to prevent the watchdog from executing duplicate mitigation loops against the same PID during the 30-second socket flush cooldown.
+
+### Fixed
+
+- **ETW High-Throughput Contention:** Decoupled the `HandleAfdEvent` kernel callback loop using an unbounded `System.Threading.Channels` queue. State aggregation is now safely deferred to the `ProcessEtwChannelAsync` background reader to prevent ETW buffer drops during network spikes.
+- **IPC Access Security (CVE Defense):** Stripped `AuthenticatedUserSid` from the `NamedPipeServerStreamAcl`. The IPC stream is now locked exclusively to `BuiltinAdministratorsSid`, preventing unprivileged local users from tampering with network thresholds or exhausting IPC server instances.
+- **Unmanaged Handle Leaks:** Wrapped all internal `Process.GetProcessById` diagnostics inside explicit `using` blocks to prevent long-term process handle exhaustion within the worker.
+- **Safe Command Line Parsing:** Replaced fragile manual substring parsing of Windows command-line arguments with a native P/Invoke wrapper for `CommandLineToArgvW`. This guarantees that recovered standalone executables retain their exact launch arguments.
+- **PID Reuse Race Conditions:** Guarded all `Process.StartTime` property retrievals within explicit `try/catch` boundaries. Recycled PIDs that expire between identification and evaluation phases cleanly abort to prevent `InvalidOperationException` pipeline crashes.
+- **WMI Performance Lag:** Implemented `_serviceNameCache` and `_processNameCache` to store WMI and process name mappings locally, permanently bypassing CPU-heavy evaluation overhead on fast-churning processes.
+- **TIME_WAIT Collision Crashes:** Extended the asynchronous mitigation delay from 15 seconds to 30 seconds. This allows the OS network stack ample time to clear `TIME_WAIT` orphaned sockets, completely eliminating `WSAEADDRINUSE` port conflict crashes when mitigated applications restart.
+- **ETW Teardown Orphans:** Fixed critical ETW unhandled teardown exceptions by invoking `_etwSession.Stop()` precisely prior to trace disposal inside the background cancellation register.
+
 ## [3.4.2] - 2026-09-26
 
 ### Fixed

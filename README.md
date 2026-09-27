@@ -55,17 +55,18 @@ NetworkWatchdogService is a modular Windows diagnostic and watchdog system desig
 - **v2.6.x:** Aggressive process tree termination (taskkill) and safe TCP TIME_WAIT kernel flush loops.
 - **v2.7.x:** Dynamic multi-service monitoring arrays and fully headless execution.
 - **v3.0.x:** Native C# .NET 8 Worker Service using zero-overhead Event Tracing for Windows (ETW) for kernel-level socket tracking.
-- **v3.1.x:** `NetworkWatchdog.TrayApp` graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
-- **v3.2.x:** Universal system-wide process monitoring (`MonitorAllProcesses`) and tray balloon alerts with a toggleable Silent Mode.
+- **v3.1.x:** NetworkWatchdog.TrayApp graphical companion for real-time system tray monitoring (color-coded health icons and interactive tooltips).
+- **v3.2.x:** Universal system-wide process monitoring (MonitorAllProcesses) and tray balloon alerts with a toggleable Silent Mode.
 - **v3.3.x:** Interactive Live Process Inspector Dashboard Form, context-menu manual process termination, and historical mitigation log viewer.
-- **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes (`NetworkWatchdogPipe`), runtime settings slider with whitelisting, UDP Syslog alert forwarding, GDI Handle hygiene guards, global unhandled exception capture, and CLI anti-tampering limits.
+- **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes, runtime settings slider with whitelisting, UDP Syslog alert forwarding, GDI Handle hygiene guards, global unhandled exception capture, and CLI anti-tampering limits.
+- **v3.5.x:** Production Readiness — Asynchronous ETW event channels, native OS TCP synchronization via GetExtendedTcpTable P/Invoke, Local Privilege Escalation (LPE) boundary guards, process PID reuse collision prevention, and BuiltinAdministratorsSid IPC lockdown.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
 NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 
-1. **Initial Baseline:** Upon discovering a monitored or active process, the service executes a single, lightweight `netstat` snapshot to capture pre-existing socket leaks.
-2. **Zero-Overhead Tracking:** Ongoing monitoring integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the `Microsoft-Windows-Winsock-AFD` provider, the service listens asynchronously to raw socket allocations in real-time, adding them to the baseline.
+1. **Initial Baseline:** Upon discovering a monitored or active process, the service executes a native snapshot using the IP Helper API to capture pre-existing socket leaks.
+2. **Zero-Overhead Tracking:** Ongoing monitoring integrates directly into the Windows Kernel via **Event Tracing for Windows (ETW)**. By subscribing to the Microsoft-Windows-Winsock-AFD provider, the service listens asynchronously to raw socket allocations in real-time, adding them to the baseline via high-throughput memory channels.
 3. **Inter-Process Streaming:** Telemetry is broadcast through a zero-disk I/O asynchronous Named Pipe server directly to the user-space tray companion.
 
 ---
@@ -74,20 +75,20 @@ NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 
 | Version | Date | Description |
 | --- | --- | --- |
-| **v1.0** | 2026‑08‑17 | Baseline diagnostic script. |
-| **v1.1** | 2026‑08‑18 | LightingService leak detection. |
-| **v1.2** | 2026‑08‑18 | Auto-restart logic. |
-| **v1.3** | 2026‑08‑18 | Popup notifications. |
-| **v1.4** | 2026‑08‑18 | Nonpaged pool monitoring. |
-| **v1.5** | 2026‑08‑18 | WebSocket storm detection. |
-| **v1.6** | 2026‑08‑18 | Continuous watchdog loop + log rotation. |
-| **v2.0** | 2026‑08‑18 | Modular architecture, config file, unified logging, service abstraction. |
-| **v2.1** | 2026‑08‑18 | Added JSON and CSV export of diagnostic runs. |
-| **v2.2** | 2026‑08‑18 | Service Health Score (0–100). |
-| **v2.3** | 2026‑08‑19 | Approved verbs, trend engine, anomaly detection, HealthTrend export. |
-| **v2.4** | 2026‑08‑19 | Restart tracking, leak growth rate, kernel trend, cooldown, webhook notifications. |
+| **v1.0.0** | 2026‑08‑17 | Baseline diagnostic script. |
+| **v1.1.0** | 2026‑08‑18 | LightingService leak detection. |
+| **v1.2.0** | 2026‑08‑18 | Auto-restart logic. |
+| **v1.3.0** | 2026‑08‑18 | Popup notifications. |
+| **v1.4.0** | 2026‑08‑18 | Nonpaged pool monitoring. |
+| **v1.5.0** | 2026‑08‑18 | WebSocket storm detection. |
+| **v1.6.0** | 2026‑08‑18 | Continuous watchdog loop + log rotation. |
+| **v2.0.0** | 2026‑08‑18 | Modular architecture, config file, unified logging, service abstraction. |
+| **v2.1.0** | 2026‑08‑18 | Added JSON and CSV export of diagnostic runs. |
+| **v2.2.0** | 2026‑08‑18 | Service Health Score (0–100). |
+| **v2.3.0** | 2026‑08‑19 | Approved verbs, trend engine, anomaly detection, HealthTrend export. |
+| **v2.4.0** | 2026‑08‑19 | Restart tracking, leak growth rate, kernel trend, cooldown, webhook notifications. |
 | **v2.4.1** | 2026‑08‑19 | Fixed timestamp parsing using ParseExact; stabilized leak growth rate; added full restart logic, cooldown, webhook support. |
-| **v2.5** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
+| **v2.5.0** | 2026‑08‑19 | ISO‑8601 timestamps, UTC mode, heartbeat, clock drift detection, quarantine, auto‑kill, watchdog health. |
 | **v2.5.1** | 2026‑08‑19 | Filesystem-safe timestamps, PS 5.1 stddev fix, ensured logs folder creation. |
 | **v2.5.2** | 2026‑08‑19 | **Absolute path stability**, `$PSScriptRoot` module imports, correct config resolution, fully location‑independent execution, hardened module loading. |
 | **v2.5.3** | 2026‑08‑19 | Unified `Write-Log -File -Message`, full path‑safety rewrite, stable heartbeat/export paths, corrected webhook payloads, eliminated DriveNotFound errors. |
@@ -106,23 +107,17 @@ NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.4.0** | 2026‑09‑24 | Added Named Pipe IPC streaming, runtime threshold slider with process whitelisting, and UDP Syslog alert forwarding. |
 | **v3.4.1** | 2026-09-24 | Fixed SCM service startup timeout via assembly bundling, resolved PipeSecurity cross-session IPC access, and fixed TrayApp fallback initialization. |
 | **v3.4.2** | 2026‑09‑26 | GDI/USER handle exhaustion hotfix, runtime UI caching, 200 Win32 handle monitoring guard, Named Pipe timeout resiliency, global unhandled exception trapping to tray_crash.log, payload regex clamping, and CLI argument injection defenses. |
+| **v3.5.0** | 2026‑09‑28 | Reached full v3.5.0 Production Readiness. Resolved ETW tracking drift, eliminated cascade restarting, implemented native GetExtendedTcpTable synchronization, patched LPE IPC vulnerabilities, preserved original CLI arguments via native P/Invoke, and resolved PID reuse collisions. |
 
 ## Key Features
 
 - Leak detection and restart with cooldown for any configured service
-- Kernel nonpaged pool monitoring
-- WebSocket storm detection
-- Health scoring and trend analysis
-- Leak growth rate
-- Nonpaged trend
-- ISO-like timestamps (filesystem-safe)
-- Optional UTC mode
-- Watchdog heartbeat (`logs/heartbeat.json`)
-- Clock drift detection
-- Quarantine mode for all monitored services
+- Zero-overhead kernel ETW tracking
+- Native TCP table background synchronization
+- IPC Dashboard & System Tray visualization
+- Local Privilege Escalation (LPE) & PID reuse defenses
 - Auto-kill for runaway processes
-- JSON + CSV exports
-- Optional webhook notifications
+- Quarantine mode for all monitored services
 - Headless autonomous console execution
 
 ---
