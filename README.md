@@ -111,6 +111,7 @@ NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.5.0** | 2026‑09‑28 | Reached full v3.5.0 Production Readiness. Resolved ETW tracking drift, eliminated cascade restarting, implemented native GetExtendedTcpTable synchronization, patched LPE IPC vulnerabilities, preserved original CLI arguments via native P/Invoke, and resolved PID reuse collisions. |
 | **v3.5.1** | 2026‑09‑28 | Resolved ETW tracking drift race conditions, patched LPE IPC vulnerabilities via Authenticode verification, implemented atomic JSON persistence with strict Administrator-only ACLs, and eliminated Named Pipe thread blockages. |
 | **v3.5.2** | 2026‑09‑28 | Implemented `SystemDirectory` binary hijacking defense, bounded IPC pipelines (64KB), strict SCM identity enforcement, process stream deadlock prevention, and regex-driven SCM state verification. |
+| **v3.5.3** | 2026‑09‑28 | Splintered the Named Pipe IPC architecture into dedicated Telemetry (Read-Only) and Control (Administrative) channels. Restored un-elevated Tray App UI functionality while strictly enforcing LPE boundary guards. |
 
 ## Key Features
 
@@ -139,6 +140,7 @@ Continuous watchdog mode:
 powershell -ExecutionPolicy Bypass -File scripts/NetworkDiag.ps1 -Watchdog
 ```
 
+> Note: The **NetworkWatchdog Dashboard** (Tray App) requires Administrator privileges only if you intend to adjust threshold settings or modify the active process whitelist. Standard users may still launch the Tray App to view live socket telemetry and historical mitigation logs.
 ---
 
 ## 📊 Exports

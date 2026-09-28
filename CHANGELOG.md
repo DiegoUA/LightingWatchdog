@@ -4,6 +4,18 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.5.3] - 2026-09-28
+
+### Security & Hardening
+
+- **IPC Pipeline Segregation (Best Practice):** Splintered the monolithic Named Pipe architecture into two dedicated endpoints to permanently resolve the un-elevated `[Access Denied]` connection issue without reintroducing Local Privilege Escalation (LPE) or Denial of Service (DoS) vulnerabilities.
+  - `NetworkWatchdogTelemetry`: Granted `ReadWrite` to `AuthenticatedUserSid`. Strictly scoped to process `GET_TELEMETRY` requests, ignoring configuration payloads.
+  - `NetworkWatchdogControl`: Granted `ReadWrite` strictly to `BuiltinAdministratorsSid` and `LocalSystem`. Handles all `UPDATE_CONFIG` and whitelisting overrides.
+
+### Fixed
+
+- **Tray App Graceful Elevation Prompts:** If a standard, un-elevated user attempts to modify the threshold slider or adjust the process whitelist via the Tray Dashboard, the app will safely catch the resulting `UnauthorizedAccessException` and render an explicit message box instructing the user to restart the interface as Administrator, preventing silent failures.
+
 ## [3.5.2] - 2026-09-28
 
 ### Security & Hardening
