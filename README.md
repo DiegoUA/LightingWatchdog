@@ -108,6 +108,7 @@ NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.4.1** | 2026-09-24 | Fixed SCM service startup timeout via assembly bundling, resolved PipeSecurity cross-session IPC access, and fixed TrayApp fallback initialization. |
 | **v3.4.2** | 2026‑09‑26 | GDI/USER handle exhaustion hotfix, runtime UI caching, 200 Win32 handle monitoring guard, Named Pipe timeout resiliency, global unhandled exception trapping to tray_crash.log, payload regex clamping, and CLI argument injection defenses. |
 | **v3.5.0** | 2026‑09‑28 | Reached full v3.5.0 Production Readiness. Resolved ETW tracking drift, eliminated cascade restarting, implemented native GetExtendedTcpTable synchronization, patched LPE IPC vulnerabilities, preserved original CLI arguments via native P/Invoke, and resolved PID reuse collisions. |
+| **v3.5.1** | 2026‑09‑28 | Resolved ETW tracking drift race conditions, patched LPE IPC vulnerabilities via Authenticode verification, implemented atomic JSON persistence with strict Administrator-only ACLs, and eliminated Named Pipe thread blockages. |
 
 ## Key Features
 
