@@ -111,15 +111,19 @@ namespace NetworkWatchdogService
                                     _pidStartTimes[pid] = currentStartTime;
                                 }
 
-                                string cleanName = Path.GetFileNameWithoutExtension(proc.ProcessName);
-                                if (_whitelist.ContainsKey(cleanName) || _whitelist.ContainsKey(proc.ProcessName)) 
+                                // Read the name exactly once, before anything is marked as
+                                // "restart in progress", so a process that exits right here
+                                // can't leave a stale _activeRestarts entry behind.
+                                string procName = proc.ProcessName;
+                                string cleanName = Path.GetFileNameWithoutExtension(procName);
+                                if (_whitelist.ContainsKey(cleanName) || _whitelist.ContainsKey(procName)) 
                                     continue;
 
                                 _logger.LogWarning("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid}!", currentConnections, _globalMaxTcpConnections, proc.Id);
                                 
                                 _activeRestarts.TryAdd(pid, DateTime.UtcNow);
                                 
-                                _ = RestartLeakingServiceAsync(proc.ProcessName, proc.Id, currentConnections, currentStartTime);
+                                _ = RestartLeakingServiceAsync(procName, proc.Id, currentConnections, currentStartTime);
                             }
                             catch (Exception)
                             {
@@ -303,6 +307,12 @@ namespace NetworkWatchdogService
             _logger.LogInformation("Initializing Named Pipe IPC Server: \\\\.\\pipe\\NetworkWatchdogPipe");
 
             var pipeSecurity = new PipeSecurity();
+
+            // Strip any inherited/default ACEs so the DACL is *only* what we add
+            // below, even if the host wrapper (or a non-standard hosting
+            // environment) would otherwise contribute default access rules.
+            pipeSecurity.SetAccessRuleProtection(true, false);
+
             var sidAdmin = new System.Security.Principal.SecurityIdentifier(
                 System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
 
@@ -311,6 +321,22 @@ namespace NetworkWatchdogService
                 sidAdmin,
                 PipeAccessRights.ReadWrite,
                 System.Security.AccessControl.AccessControlType.Allow));
+
+            // The accept loop hands each connected instance to a handler task and
+            // immediately creates the next instance while the previous one is
+            // still alive. CreateNamedPipe checks FILE_CREATE_PIPE_INSTANCE against
+            // the existing instance's DACL, and PipeAccessRights.ReadWrite does not
+            // include it - so with an admins-only ReadWrite ACL the second instance
+            // would fail with "access denied". Grant that one right to the
+            // service's own identity only (clients don't need it).
+            var serviceSid = System.Security.Principal.WindowsIdentity.GetCurrent().User;
+            if (serviceSid != null)
+            {
+                pipeSecurity.AddAccessRule(new PipeAccessRule(
+                    serviceSid,
+                    PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance,
+                    System.Security.AccessControl.AccessControlType.Allow));
+            }
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -353,41 +379,82 @@ namespace NetworkWatchdogService
             }
         }
 
+        private const int MaxIpcLineChars = 64 * 1024;
+        private static readonly TimeSpan IpcClientTimeout = TimeSpan.FromSeconds(10);
+
         private async Task HandlePipeClientAsync(NamedPipeServerStream server, CancellationToken stoppingToken)
         {
             using (server)
             using (var reader = new StreamReader(server, Encoding.UTF8))
             using (var writer = new StreamWriter(server, Encoding.UTF8) { AutoFlush = true })
+            // Per-connection deadline: each client now has its own task and pipe
+            // instance, so without this a client that connects and goes quiet would
+            // hold an instance (of a finite pool) indefinitely.
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken))
             {
+                cts.CancelAfter(IpcClientTimeout);
+                var token = cts.Token;
+
                 try
                 {
-                    string? line = await reader.ReadLineAsync(stoppingToken);
+                    string? line = await ReadBoundedLineAsync(reader, MaxIpcLineChars, token);
                     if (!string.IsNullOrWhiteSpace(line))
                     {
                         if (line == "GET_TELEMETRY")
                         {
                             var packet = BuildTelemetryPacket();
                             string json = JsonSerializer.Serialize(packet);
-                            await writer.WriteLineAsync(json.AsMemory(), stoppingToken);
+                            await writer.WriteLineAsync(json.AsMemory(), token);
                         }
                         else if (line.StartsWith("UPDATE_CONFIG:"))
                         {
                             string jsonPayload = line.Substring("UPDATE_CONFIG:".Length);
                             var updateCmd = JsonSerializer.Deserialize<ConfigUpdateCommand>(jsonPayload);
                             if (updateCmd != null) ApplyConfigUpdate(updateCmd);
-                            await writer.WriteLineAsync("OK".AsMemory(), stoppingToken);
+                            await writer.WriteLineAsync("OK".AsMemory(), token);
                         }
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    // Service shutting down or client-specific timeout - ignore.
+                    if (!stoppingToken.IsCancellationRequested)
+                        _logger.LogWarning("IPC client did not complete within {seconds}s; dropping connection.", IpcClientTimeout.TotalSeconds);
+                }
+                catch (InvalidDataException ex)
+                {
+                    _logger.LogWarning("IPC client rejected: {reason}", ex.Message);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "IPC Named Pipe client-handler error.");
                 }
             }
+        }
+
+        /// <summary>
+        /// Reads one line but never buffers more than maxChars, so a client that
+        /// streams data without ever sending a newline can't grow the service's
+        /// memory without bound (ReadLineAsync has no such limit).
+        /// </summary>
+        private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, int maxChars, CancellationToken token)
+        {
+            var sb = new StringBuilder();
+            var one = new char[1];
+
+            // StreamReader buffers internally, so single-char reads don't hit the pipe each time.
+            while (await reader.ReadAsync(one.AsMemory(), token) > 0)
+            {
+                char c = one[0];
+                if (c == '\n') break;
+                if (c == '\r') continue;
+
+                if (sb.Length >= maxChars)
+                    throw new InvalidDataException($"IPC line exceeded {maxChars} characters.");
+
+                sb.Append(c);
+            }
+
+            return sb.Length == 0 ? null : sb.ToString();
         }
 
         private TelemetryPacket BuildTelemetryPacket()
@@ -446,8 +513,9 @@ namespace NetworkWatchdogService
 
             if (!string.IsNullOrWhiteSpace(cmd.AddWhitelist))
             {
-                string entry = Path.GetFileNameWithoutExtension(cmd.AddWhitelist.Trim());
-                if (_whitelist.TryAdd(entry, 1))
+                // Same normalization/validation as entries loaded from disk, so
+                // IPC edits and out-of-band file edits can't diverge.
+                if (TryNormalizeWhitelistEntry(cmd.AddWhitelist, out string entry) && _whitelist.TryAdd(entry, 1))
                 {
                     whitelistChanged = true;
                     _logger.LogInformation("IPC: Added {name} to whitelist.", entry);
@@ -455,8 +523,7 @@ namespace NetworkWatchdogService
             }
             if (!string.IsNullOrWhiteSpace(cmd.RemoveWhitelist))
             {
-                string entry = Path.GetFileNameWithoutExtension(cmd.RemoveWhitelist.Trim());
-                if (_whitelist.TryRemove(entry, out _))
+                if (TryNormalizeWhitelistEntry(cmd.RemoveWhitelist, out string entry) && _whitelist.TryRemove(entry, out _))
                 {
                     whitelistChanged = true;
                     _logger.LogInformation("IPC: Removed {name} from whitelist.", entry);
@@ -471,23 +538,91 @@ namespace NetworkWatchdogService
             }
         }
 
+        private const long MaxWhitelistFileBytes = 1024 * 1024;
+        private const int MaxWhitelistEntries = 10_000;
+        private const int MaxWhitelistEntryLength = 260;
+
+        /// <summary>
+        /// Normalizes a whitelist entry the same way everywhere (trim, strip
+        /// any directory part and extension) and rejects empty/oversized values.
+        /// </summary>
+        private static bool TryNormalizeWhitelistEntry(string? raw, out string entry)
+        {
+            entry = string.Empty;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+
+            string normalized = Path.GetFileNameWithoutExtension(raw.Trim());
+            if (string.IsNullOrWhiteSpace(normalized) || normalized.Length > MaxWhitelistEntryLength) return false;
+
+            entry = normalized;
+            return true;
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
         private void LoadWhitelistFromDisk()
         {
             try
             {
                 if (!File.Exists(_whitelistFilePath)) return;
 
-                string json = File.ReadAllText(_whitelistFilePath);
-                var entries = JsonSerializer.Deserialize<List<string>>(json);
-                if (entries == null) return;
-
-                foreach (var entry in entries)
+                // Refuse to trust the persisted file unless both it and its
+                // directory are owned by, and writable only by, Administrators
+                // or SYSTEM. This covers the window before the service first
+                // locked the directory down, and a directory pre-created by a
+                // standard user. Failing closed means an empty dynamic
+                // whitelist, i.e. more processes are monitored, not fewer.
+                string? dir = Path.GetDirectoryName(_whitelistFilePath);
+                if (string.IsNullOrEmpty(dir) ||
+                    !IsAdminOnlyLocation(dir, isDirectory: true) ||
+                    !IsAdminOnlyLocation(_whitelistFilePath, isDirectory: false))
                 {
-                    if (!string.IsNullOrWhiteSpace(entry))
-                        _whitelist.TryAdd(entry, 1);
+                    _logger.LogCritical("Refusing to load whitelist from {path}: file or directory is not exclusively owned/writable by Administrators or SYSTEM. Starting with an empty dynamic whitelist.", _whitelistFilePath);
+                    return;
                 }
 
-                _logger.LogInformation("Loaded {count} whitelist entries from {path}.", entries.Count, _whitelistFilePath);
+                if (new FileInfo(_whitelistFilePath).Length > MaxWhitelistFileBytes)
+                {
+                    _logger.LogError("Refusing to load whitelist from {path}: file exceeds {max} bytes.", _whitelistFilePath, MaxWhitelistFileBytes);
+                    return;
+                }
+
+                List<string?>? rawEntries;
+                try
+                {
+                    rawEntries = JsonSerializer.Deserialize<List<string?>>(File.ReadAllText(_whitelistFilePath));
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogError(ex, "Whitelist file {path} is not a valid JSON array of strings; starting with an empty dynamic whitelist.", _whitelistFilePath);
+                    return;
+                }
+
+                if (rawEntries == null) return;
+
+                // Validate + case-insensitively de-duplicate before touching the
+                // live whitelist, so out-of-band edits (hand-edited casing,
+                // "foo.exe" vs "FOO", nulls, blanks, junk) can't leave it in an
+                // inconsistent state.
+                var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int invalid = 0, duplicates = 0;
+
+                foreach (var raw in rawEntries)
+                {
+                    if (unique.Count >= MaxWhitelistEntries)
+                    {
+                        _logger.LogWarning("Whitelist file has more than {max} entries; ignoring the rest.", MaxWhitelistEntries);
+                        break;
+                    }
+
+                    if (!TryNormalizeWhitelistEntry(raw, out string entry)) { invalid++; continue; }
+                    if (!unique.Add(entry)) { duplicates++; }
+                }
+
+                foreach (var entry in unique)
+                    _whitelist.TryAdd(entry, 1);
+
+                _logger.LogInformation("Loaded {count} whitelist entries from {path} ({dupes} duplicates and {invalid} invalid entries skipped).",
+                    unique.Count, _whitelistFilePath, duplicates, invalid);
             }
             catch (Exception ex)
             {
@@ -495,6 +630,86 @@ namespace NetworkWatchdogService
             }
         }
 
+        /// <summary>
+        /// True only if the path is not a reparse point, is owned by
+        /// BuiltinAdministrators or LocalSystem, and no other principal has an
+        /// Allow rule granting write/delete/permission-change rights.
+        /// </summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private bool IsAdminOnlyLocation(string path, bool isDirectory)
+        {
+            try
+            {
+                var admins = new System.Security.Principal.SecurityIdentifier(
+                    System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+                var system = new System.Security.Principal.SecurityIdentifier(
+                    System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+
+                // A junction/symlink could redirect us to attacker-controlled content.
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                {
+                    _logger.LogWarning("{path} is a reparse point; treating as untrusted.", path);
+                    return false;
+                }
+
+                System.Security.AccessControl.FileSystemSecurity security = isDirectory
+                    ? new DirectoryInfo(path).GetAccessControl()
+                    : new FileInfo(path).GetAccessControl();
+
+                var owner = security.GetOwner(typeof(System.Security.Principal.SecurityIdentifier))
+                    as System.Security.Principal.SecurityIdentifier;
+                if (owner == null || !(owner.Equals(admins) || owner.Equals(system)))
+                {
+                    _logger.LogWarning("{path} is owned by {owner}, not Administrators/SYSTEM.", path, owner?.Value ?? "unknown");
+                    return false;
+                }
+
+                // Inheritable ACEs and hand-built ACLs can carry *unmapped* generic
+                // rights (GENERIC_WRITE 0x40000000, GENERIC_ALL 0x10000000), which the
+                // FileSystemRights enum has no names for and which would slip past a
+                // check that only looks at the specific bits. (CreateFiles and
+                // CreateDirectories are the same bits as WriteData/AppendData, so
+                // those are already covered below.)
+                const System.Security.AccessControl.FileSystemRights genericWrite = (System.Security.AccessControl.FileSystemRights)0x40000000;
+                const System.Security.AccessControl.FileSystemRights genericAll = (System.Security.AccessControl.FileSystemRights)0x10000000;
+
+                const System.Security.AccessControl.FileSystemRights writeish =
+                    genericWrite |
+                    genericAll |
+                    System.Security.AccessControl.FileSystemRights.WriteData |
+                    System.Security.AccessControl.FileSystemRights.AppendData |
+                    System.Security.AccessControl.FileSystemRights.WriteExtendedAttributes |
+                    System.Security.AccessControl.FileSystemRights.WriteAttributes |
+                    System.Security.AccessControl.FileSystemRights.Delete |
+                    System.Security.AccessControl.FileSystemRights.DeleteSubdirectoriesAndFiles |
+                    System.Security.AccessControl.FileSystemRights.ChangePermissions |
+                    System.Security.AccessControl.FileSystemRights.TakeOwnership;
+
+                foreach (System.Security.AccessControl.FileSystemAccessRule rule in
+                    security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+                {
+                    if (rule.AccessControlType != System.Security.AccessControl.AccessControlType.Allow) continue;
+
+                    var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
+                    if (sid.Equals(admins) || sid.Equals(system)) continue;
+
+                    if ((rule.FileSystemRights & writeish) != 0)
+                    {
+                        _logger.LogWarning("{path} grants write-capable access to {sid}.", path, sid.Value);
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not verify ownership/ACL of {path}; treating as untrusted.", path);
+                return false;
+            }
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
         private async Task SaveWhitelistToDiskAsync()
         {
             await _whitelistFileLock.WaitAsync();
@@ -503,7 +718,6 @@ namespace NetworkWatchdogService
                 string? dir = Path.GetDirectoryName(_whitelistFilePath);
                 if (!string.IsNullOrEmpty(dir))
                 {
-                    bool dirExisted = Directory.Exists(dir);
                     Directory.CreateDirectory(dir);
 
                     // Lock the ACL down every save, not just on first creation:
@@ -516,24 +730,47 @@ namespace NetworkWatchdogService
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Failed to lock down ACLs on {dir}; whitelist directory may be writable by non-admin users.", dir);
-                        if (!dirExisted)
-                        {
-                            // We just created an unsecured directory and couldn't
-                            // secure it - refuse to write the whitelist into it
-                            // rather than silently leaving a tamperable file.
-                            return;
-                        }
+                        _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir);
+                    }
+
+                    // Verify the resulting state rather than assuming it. This also
+                    // catches a directory pre-created by a standard user: they stay
+                    // the owner (and can always rewrite the DACL), so we refuse to
+                    // write the whitelist there instead of leaving a tamperable file.
+                    if (!IsAdminOnlyLocation(dir, isDirectory: true))
+                    {
+                        _logger.LogCritical("Not persisting whitelist: {dir} is not exclusively controlled by Administrators/SYSTEM.", dir);
+                        return;
                     }
                 }
 
                 // Write to a temp file and swap it in, so a crash/power-loss
                 // mid-write can't leave a truncated/corrupt whitelist.json
                 // that fails to parse on the next startup.
-                string tempPath = _whitelistFilePath + ".tmp";
-                string json = JsonSerializer.Serialize(_whitelist.Keys.ToList());
-                await File.WriteAllTextAsync(tempPath, json);
-                File.Move(tempPath, _whitelistFilePath, overwrite: true);
+                //
+                // The temp name is unpredictable and opened with FileMode.CreateNew
+                // (CREATE_NEW), which fails if *anything* already exists at that
+                // path - a file, hard link, or symlink - so nothing pre-planted can
+                // redirect the write. (The directory is also verified admin-only
+                // above; this removes the reliance on that check staying true
+                // between the check and the write.)
+                string tempPath = _whitelistFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(_whitelist.Keys.ToList()));
+                try
+                {
+                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        bufferSize: 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+                    {
+                        await fs.WriteAsync(payload);
+                        await fs.FlushAsync();
+                    }
+                    File.Move(tempPath, _whitelistFilePath, overwrite: true);
+                }
+                catch
+                {
+                    try { File.Delete(tempPath); } catch { /* best effort */ }
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -755,12 +992,21 @@ namespace NetworkWatchdogService
                     return;
                 }
 
+                // Only a name the SCM itself reported for this PID may be handed to
+                // sc.exe. The process *image name* is chosen by whoever launched the
+                // process, so using it as a service name would let anyone stop/start
+                // an arbitrary service just by naming a leaking binary after it.
+                // It is kept for logging/telemetry only.
                 string? actualServiceName = GetServiceNameFromPidCached(processId);
-                string serviceNameToUse = !string.IsNullOrEmpty(actualServiceName) ? actualServiceName : fallbackServiceName;
+                string? scmServiceName = IsValidServiceName(actualServiceName) ? actualServiceName : null;
+                string serviceNameToUse = scmServiceName ?? fallbackServiceName;
 
                 _logger.LogWarning("Force killing leaking process/service {serviceName} (PID {pid})...", serviceNameToUse, processId);
 
-                ExecuteSafeCommand("sc.exe", new[] { "stop", serviceNameToUse }, suppressErrors: true);
+                if (scmServiceName != null)
+                {
+                    ExecuteSafeCommand("sc.exe", new[] { "stop", scmServiceName }, suppressErrors: true);
+                }
 
                 // Final identity re-check right before the destructive taskkill call.
                 if (!TryVerifySamePid(processId, expectedStartTime, out _))
@@ -789,17 +1035,46 @@ namespace NetworkWatchdogService
                 // "trusted" but user-writable subdirectory) could otherwise
                 // get arbitrary arguments/code executed under this service's
                 // SYSTEM identity.
-                bool startedAsService = TryStartService(serviceNameToUse);
-                if (!startedAsService)
+                if (scmServiceName == null)
                 {
-                    _logger.LogWarning("Service {serviceName} could not be restarted via the Service Control Manager. " +
-                        "Standalone executable relaunch is disabled by design; manual intervention is required.", serviceNameToUse);
+                    _logger.LogInformation("PID {pid} ({name}) is not a registered Windows service; it was terminated and will not be relaunched.", processId, serviceNameToUse);
+                }
+                else if (await TryStartServiceAsync(scmServiceName))
+                {
+                    _logger.LogInformation("Service {serviceName} is running again after the restart.", scmServiceName);
+                }
+                else
+                {
+                    // The specific reason (exit code, state, timeout) was logged by TryStartServiceAsync.
+                    _logger.LogWarning("Service {serviceName} was not confirmed running after the restart attempt. " +
+                        "Standalone executable relaunch is disabled by design; manual intervention may be required.", scmServiceName);
                 }
             }
             finally
             {
                 _activeRestarts.TryRemove(processId, out _);
             }
+        }
+
+        /// <summary>
+        /// Defense-in-depth sanity check on a service short name before it is
+        /// passed to sc.exe. Deliberately not "alphanumeric only": service names
+        /// may legally contain spaces and punctuation, and a strict allow-list
+        /// would silently stop us restarting those services. Rejects what could
+        /// confuse sc.exe's own parsing (path separators / a leading option or
+        /// server prefix), quotes, control characters, and over-long names.
+        /// </summary>
+        private static bool IsValidServiceName([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || name.Length > 256) return false;
+            if (name != name.Trim()) return false;
+            if (name[0] == '-' || name[0] == '/') return false;
+
+            foreach (char c in name)
+            {
+                if (char.IsControl(c) || c == '/' || c == '\\' || c == '"') return false;
+            }
+            return true;
         }
 
         /// <summary>
@@ -827,36 +1102,143 @@ namespace NetworkWatchdogService
             }
         }
 
-        private bool TryStartService(string serviceName)
+        private const int ERROR_SERVICE_ALREADY_RUNNING = 1056;
+        private const int ServiceStateStopped = 1;
+        private const int ServiceStateRunning = 4;
+        private static readonly TimeSpan ScCommandTimeout = TimeSpan.FromSeconds(30);
+        private static readonly System.Text.RegularExpressions.Regex ScStateRegex =
+            new(@"STATE\s*:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Starts a service via sc.exe and then confirms it actually reached
+        /// RUNNING, logging the specific reason whenever it did not. Returns
+        /// true only for a confirmed-running service.
+        /// </summary>
+        private async Task<bool> TryStartServiceAsync(string serviceName)
         {
+            // No separate existence probe: 'sc start' itself reports a missing
+            // service (1060), access problems (5), a disabled service (1058), etc.
+            var start = await RunScAsync("start", serviceName);
+            if (start == null) return false; // launch/timeout failure already logged
+
+            var (startExit, startOutput) = start.Value;
+
+            // 0    = start request accepted (service is START_PENDING or RUNNING).
+            // 1056 = already running. Expected when the service's own SCM recovery
+            //        actions restarted it during our wait, so not a failure.
+            if (startExit != 0 && startExit != ERROR_SERVICE_ALREADY_RUNNING)
+            {
+                _logger.LogWarning("'sc start {service}' failed with exit code {code}: {output}", serviceName, startExit, startOutput);
+                return false;
+            }
+
+            // Accepted is not the same as running - poll the real state.
+            const int maxPolls = 15;
+            int? lastState = null;
+
+            for (int i = 0; i < maxPolls; i++)
+            {
+                var query = await RunScAsync("query", serviceName);
+                if (query != null)
+                {
+                    var (queryExit, queryOutput) = query.Value;
+                    if (queryExit != 0)
+                    {
+                        _logger.LogWarning("'sc query {service}' failed with exit code {code}: {output}", serviceName, queryExit, queryOutput);
+                        return false;
+                    }
+
+                    var match = ScStateRegex.Match(queryOutput);
+                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out int state))
+                    {
+                        _logger.LogWarning("Start of {service} was accepted (sc start exit code {code}) but its state could not be read from 'sc query', so it is not confirmed running.", serviceName, startExit);
+                        return false;
+                    }
+
+                    lastState = state;
+
+                    if (state == ServiceStateRunning) return true;
+
+                    if (state == ServiceStateStopped)
+                    {
+                        _logger.LogWarning("Service {service} went back to STOPPED right after start was accepted (it likely failed during startup). sc query output: {output}", serviceName, queryOutput);
+                        return false;
+                    }
+                    // START_PENDING (or another transitional state): keep waiting.
+                }
+
+                await Task.Delay(2000);
+            }
+
+            _logger.LogWarning("Service {service} did not reach RUNNING within {seconds}s (last observed state code: {state}).", serviceName, maxPolls * 2, lastState?.ToString() ?? "unknown");
+            return false;
+        }
+
+        /// <summary>
+        /// Runs sc.exe (from the system directory) and returns its exit code and
+        /// combined output, or null if it could not be launched or timed out.
+        /// </summary>
+        private async Task<(int ExitCode, string Output)?> RunScAsync(params string[] args)
+        {
+            string argText = string.Join(' ', args);
             try
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "sc.exe",
-                    ArgumentList = { "query", serviceName },
+                    FileName = SystemExe("sc.exe"),
                     RedirectStandardOutput = true,
+                    RedirectStandardError = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
-                using var proc = Process.Start(psi);
-                proc?.WaitForExit();
+                foreach (var arg in args) psi.ArgumentList.Add(arg);
 
-                if (proc?.ExitCode == 0)
+                using var proc = Process.Start(psi);
+                if (proc == null)
                 {
-                    ExecuteSafeCommand("sc.exe", new[] { "start", serviceName }, suppressErrors: true);
-                    return true;
+                    _logger.LogError("sc.exe {args} could not be started.", argText);
+                    return null;
                 }
+
+                // Drain both streams while waiting; waiting first on a redirected
+                // stream that fills its pipe buffer would hang the child and us.
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
+
+                using var cts = new CancellationTokenSource(ScCommandTimeout);
+                try
+                {
+                    await proc.WaitForExitAsync(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                    _logger.LogWarning("sc.exe {args} did not finish within {seconds}s and was terminated.", argText, ScCommandTimeout.TotalSeconds);
+                    return null;
+                }
+
+                string output = ((await stdoutTask) + (await stderrTask)).Trim();
+                return (proc.ExitCode, output);
             }
-            catch { }
-            return false;
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to run sc.exe {args}.", argText);
+                return null;
+            }
         }
+
+        /// <summary>
+        /// Full path to a system utility. Launching a bare "sc.exe" as SYSTEM
+        /// lets CreateProcess look in the service's own directory first, so a
+        /// planted binary there would run with the service's privileges.
+        /// </summary>
+        private static string SystemExe(string fileName) => Path.Combine(Environment.SystemDirectory, fileName);
 
         private void ExecuteSafeCommand(string filename, string[] args, bool suppressErrors = false)
         {
             try
             {
-                var psi = new ProcessStartInfo { FileName = filename, UseShellExecute = false, CreateNoWindow = true };
+                var psi = new ProcessStartInfo { FileName = SystemExe(filename), UseShellExecute = false, CreateNoWindow = true };
                 foreach (var arg in args)
                 {
                     psi.ArgumentList.Add(arg);

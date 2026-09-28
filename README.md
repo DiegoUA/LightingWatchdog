@@ -59,7 +59,8 @@ NetworkWatchdogService is a modular Windows diagnostic and watchdog system desig
 - **v3.2.x:** Universal system-wide process monitoring (MonitorAllProcesses) and tray balloon alerts with a toggleable Silent Mode.
 - **v3.3.x:** Interactive Live Process Inspector Dashboard Form, context-menu manual process termination, and historical mitigation log viewer.
 - **v3.4.x:** Inter-Process Communication (IPC) via Named Pipes, runtime settings slider with whitelisting, UDP Syslog alert forwarding, GDI Handle hygiene guards, global unhandled exception capture, and CLI anti-tampering limits.
-- **v3.5.x:** Production Readiness — Asynchronous ETW event channels, native OS TCP synchronization via GetExtendedTcpTable P/Invoke, Local Privilege Escalation (LPE) boundary guards, process PID reuse collision prevention, and BuiltinAdministratorsSid IPC lockdown.
+- **v3.5.0-3.5.1:** Production Readiness — Asynchronous ETW event channels, native OS TCP synchronization via GetExtendedTcpTable P/Invoke, Local Privilege Escalation (LPE) boundary guards with Authenticode verification, process PID reuse collision prevention, BuiltinAdministratorsSid IPC lockdown, and atomic secure-ACL JSON persistence.
+- **v3.5.2:** Advanced Security & Diagnostics — `Environment.SystemDirectory` binary hijacking defense, strict SCM identity spoofing guards, 64KB bounded IPC pipelines, and regex-driven `sc query` state verification polling.
 
 ### ⚡ Core Architecture: Zero-Overhead Monitoring
 
@@ -109,6 +110,7 @@ NetworkWatchdogService (v3.x+) utilizes a hybrid state-tracking architecture:
 | **v3.4.2** | 2026‑09‑26 | GDI/USER handle exhaustion hotfix, runtime UI caching, 200 Win32 handle monitoring guard, Named Pipe timeout resiliency, global unhandled exception trapping to tray_crash.log, payload regex clamping, and CLI argument injection defenses. |
 | **v3.5.0** | 2026‑09‑28 | Reached full v3.5.0 Production Readiness. Resolved ETW tracking drift, eliminated cascade restarting, implemented native GetExtendedTcpTable synchronization, patched LPE IPC vulnerabilities, preserved original CLI arguments via native P/Invoke, and resolved PID reuse collisions. |
 | **v3.5.1** | 2026‑09‑28 | Resolved ETW tracking drift race conditions, patched LPE IPC vulnerabilities via Authenticode verification, implemented atomic JSON persistence with strict Administrator-only ACLs, and eliminated Named Pipe thread blockages. |
+| **v3.5.2** | 2026‑09‑28 | Implemented `SystemDirectory` binary hijacking defense, bounded IPC pipelines (64KB), strict SCM identity enforcement, process stream deadlock prevention, and regex-driven SCM state verification. |
 
 ## Key Features
 

@@ -4,6 +4,47 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.5.2] - 2026-09-28
+
+### Security & Hardening
+
+- **Binary Hijacking Defense:** Resolving utility calls via `Environment.SystemDirectory` (`SystemExe()`) guarantees that binaries like `sc.exe` and `taskkill.exe` are loaded exclusively from the Windows system folder, fully neutralizing executable planting attacks in working directories.
+- **Strict SCM Service Identity Enforcement:** Restricting `sc.exe` invocations strictly to names confirmed via WMI (`scmServiceName`), combined with rejecting path delimiters, control characters, leading option flags, and quotes via `IsValidServiceName`, resolves severe service name spoofing and parameter injection vulnerabilities.
+- **Bounded IPC Pipeline & Client Timeouts:** Replaced standard `ReadLineAsync` with a custom `ReadBoundedLineAsync` enforcing a strict 64 KB read limit and a 10-second per-connection deadline, preventing unbounded memory growth and resource starvation from malicious or hanging IPC clients.
+- **Atomic Temp File Generation:** Replacing predictable temporary file paths with `Guid.NewGuid()` and utilizing `FileMode.CreateNew` effectively eliminates symlink-planting vectors and removes Time-of-Check to Time-of-Use (TOCTOU) gaps during whitelist persistence.
+- **Explicit Mask Mapping:** Included explicit integer representations for `GENERIC_WRITE` (`0x40000000`) and `GENERIC_ALL` (`0x10000000`) in the directory ACL validator, ensuring complete bitmask coverage against unmapped ACEs during persistence integrity verification.
+
+### Added
+
+- **State Verification via TryStartServiceAsync:** Overhauled the service restart lifecycle. Converts `sc start` execution into an accepted-intent signal, gracefully handles `1056` (already running) states, and explicitly polls `sc query` every 2 seconds for up to 30 seconds using Regex to strictly confirm a `RUNNING` status.
+- **End-to-End Service Restart Tracing:** The worker now produces detailed, multi-phase operational traces across detection, the 30-second `TIME_WAIT` post-kill pause, and the full SCM recovery execution lifecycle.
+- **Explicit Failure Diagnostics:** Blind exception handlers have been stripped and replaced with high-fidelity error reporting across all execution branches (unsupported state output, non-zero return codes, timeouts, or failure to launch).
+
+### Fixed
+
+- **Process Stream Drain Deadlocks:** The implementation of `RunScAsync` now reads standard output and standard error concurrently while awaiting process termination. This structurally avoids standard pipe buffer exhaustion deadlocks that previously caused the worker to hang during `sc query`.
+
+## [3.5.1] - 2026-09-28
+
+### Added
+
+- **Native OS Socket Synchronization:** Completely eliminated `netstat.exe` subprocess dependencies. `PeriodicResyncLoopAsync` now queries the Windows kernel directly via P/Invoke `GetExtendedTcpTable`, providing sub-millisecond, dead-lock-free socket baseline resolution to correct ETW telemetry drift.
+- **WMI Service Mapping:** Integrated Windows Management Instrumentation (WMI) to automatically map process IDs directly to their registered SCM service names. WMI resolution is optimized via `RefreshServiceNameCacheIfStale` to batch queries and eliminate high-load CPU spikes.
+- **LPE Target Boundary & Authenticode Validation (Anti-Malware):** Introduced `IsTrustedExecutablePath` and `IsAuthenticodeSigned`. The watchdog actively blocks path traversal (`..\`) and refuses to relaunch any non-service executable that is not cryptographically signed and housed inside `C:\Windows` or `C:\Program Files`, entirely mitigating Local Privilege Escalation (LPE) vulnerabilities.
+- **Cache Pruning Engine:** Added `PruneStaleCaches` to dynamically clear dead PID metadata mappings (`_pidStartTimes`, `_processNameCache`, `_serviceNameCache`), eliminating infinite internal memory growth.
+- **Atomic Persistence Engine:** IPC dynamic whitelist modifications are now asynchronously persisted to disk using a fail-safe `.tmp` swap mechanism, preventing `whitelist.json` corruption during mid-write power failures or service crashes.
+- **Secure Directory ACLs:** Hardened the `%ProgramData%` persistence folder by proactively stripping inherited permissions (`SetAccessRuleProtection`) and strictly locking `FullControl` to `BuiltinAdministrators` and `LocalSystem`. This closes a vulnerability where standard users could modify the whitelist JSON to exclude malware from watchdog restarts.
+- **Multi-Target TFM Compatibility:** Implemented conditional compilation (`#if NET9_0_OR_GREATER`) for Authenticode signature validation, ensuring the codebase compiles natively without obsolete warnings across both legacy .NET 8 environments and modern .NET 9+ SDKs.
+- **Concurrency Guard:** Integrated `SemaphoreSlim(1, 1)` to perfectly serialize asynchronous disk I/O operations from rapid, overlapping IPC config updates.
+
+### Fixed
+
+- **ETW Race Conditions:** Synchronized the `HandleAfdEvent` ETW asynchronous channel and `ResyncGlobalBaseline` using a discrete `_connectionCountsLock`, eliminating memory corruption and dropped increments during simultaneous read/write cycles.
+- **IPC Access Security (CVE Defense):** Stripped `AuthenticatedUserSid` from the `NamedPipeServerStreamAcl`. The IPC stream is now locked exclusively to `BuiltinAdministratorsSid`, preventing unprivileged local users from tampering with network thresholds or exhausting IPC server instances.
+- **IPC Polling Deadlocks:** Refactored `StartNamedPipeServerAsync` to hand off connected pipes to `HandlePipeClientAsync` on independent tasks, guaranteeing simultaneous, non-blocking cross-process telemetry streaming.
+- **PID Reuse Race Conditions:** Guarded `Process.StartTime` property retrievals within explicit `TryVerifySamePid` boundaries. The PID identity is now double-verified both before *and* directly after the 30-second mitigation window, ensuring the OS hasn't recycled the PID to an innocent application right before the `taskkill` strike.
+- **TCP Table Buffer Exhaustion:** Wrapped native `GetExtendedTcpTable` pointers inside an `ERROR_INSUFFICIENT_BUFFER` loop, ensuring table queries automatically expand unmanaged memory allocations when the Windows connection table surges dramatically between byte calculations.
+
 ## [3.5.0] - 2026-09-28
 
 ### Added
