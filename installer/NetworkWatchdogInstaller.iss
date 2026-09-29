@@ -12,12 +12,12 @@ SetupLogging=yes
 CloseApplications=force
 
 [Files]
-; The Background Service (Ensure you ran `dotnet publish -r win-x64 -c Release /p:PublishSingleFile=true` first)
-Source: "..\src\NetworkWatchdogService\bin\Release\net8.0-windows\win-x64\publish\NetworkWatchdogService.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\src\NetworkWatchdogService\bin\Release\net8.0-windows\win-x64\publish\appsettings.json"; DestDir: "{app}"; Flags: ignoreversion
+; The Background Service
+Source: "..\out\service\NetworkWatchdogService.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\out\service\appsettings.json"; DestDir: "{app}"; Flags: ignoreversion
 
 ; The Tray Application
-Source: "..\src\NetworkWatchdog.TrayApp\bin\Release\net8.0-windows\NetworkWatchdog.TrayApp.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\out\tray\NetworkWatchdog.TrayApp.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autostartup}\Network Watchdog Tray"; Filename: "{app}\NetworkWatchdog.TrayApp.exe"

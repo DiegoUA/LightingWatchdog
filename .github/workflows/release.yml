@@ -10,28 +10,24 @@ permissions:
 
 jobs:
   release:
-    # We must use windows-latest to natively compile the C# Windows Service 
-    # and run the Inno Setup compiler.
     runs-on: windows-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Publish Background Service (win-x64)
-        run: dotnet publish src/NetworkWatchdogService/NetworkWatchdogService.csproj -r win-x64 -c Release /p:PublishSingleFile=true
+        run: dotnet publish src/NetworkWatchdogService/NetworkWatchdogService.csproj -r win-x64 -c Release /p:PublishSingleFile=true -o out\service
 
       - name: Publish Tray Application (win-x64)
-        run: dotnet publish src/NetworkWatchdog.TrayApp/NetworkWatchdog.TrayApp.csproj -r win-x64 -c Release
+        run: dotnet publish src/NetworkWatchdog.TrayApp/NetworkWatchdog.TrayApp.csproj -r win-x64 -c Release -o out\tray
 
       - name: Compile Inno Setup Installer
-        # GitHub's windows-latest runners have Inno Setup 6 pre-installed.
-        # This compiles the script and generates the .exe in installer/Output/
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\NetworkWatchdogInstaller.iss
 
@@ -52,5 +48,4 @@ jobs:
           body: ${{ steps.notes.outputs.body }}
           token: ${{ secrets.GITHUB_TOKEN }}
           make_latest: true
-          # This automatically attaches the compiled installer to the GitHub Release!
           files: installer/Output/NetworkWatchdog_Installer.exe
