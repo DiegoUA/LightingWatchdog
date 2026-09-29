@@ -4,6 +4,13 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.6.0] - 2026-09-30
+
+### Added
+
+- **Self-Contained Installer Package:** Created an Inno Setup script (`installer/NetworkWatchdogInstaller.iss`) that automatically stops legacy background processes, copies compiled binaries to `Program Files`, registers the SCM Background Service, and configures the Tray Application to launch silently at user login.
+- **GitHub Auto-Update Engine:** The Tray App now natively queries the `NetworkWatchdog` GitHub API every 24 hours (or on-demand via the system tray context menu). Upon detecting a semantic version increment, it prompts the user, downloads the `.exe` installer asset to `%TEMP%`, and executes a silent overwrite, seamlessly tearing down and relaunching the background service with zero manual intervention.
+
 ## [3.5.3] - 2026-09-28
 
 ### Security & Hardening

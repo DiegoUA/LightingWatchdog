@@ -5,9 +5,11 @@ using System.Drawing;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace NetworkWatchdog.TrayApp
@@ -27,6 +29,7 @@ namespace NetworkWatchdog.TrayApp
     {
         private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _timer;
+        private readonly System.Windows.Forms.Timer _updateTimer;
         private readonly string _csvHealthPath;
         private bool _isSilentMode = false;
         private string _lastRestartEvent = string.Empty;
@@ -61,9 +64,25 @@ namespace NetworkWatchdog.TrayApp
             _trayIcon.DoubleClick += (s, e) => ShowDashboard();
             RebuildContextMenu(new List<ProcessTelemetryItem>());
 
+            // Telemetry Polling Timer
             _timer = new System.Windows.Forms.Timer { Interval = 2000 };
             _timer.Tick += (s, e) => PollTelemetry();
             _timer.Start();
+
+            // GitHub Auto-Updater Timer (Checks every 24 hours)
+            _updateTimer = new System.Windows.Forms.Timer { Interval = 86400000 };
+            _updateTimer.Tick += async (s, e) => await GitHubAutoUpdater.CheckForUpdatesAsync();
+            _updateTimer.Start();
+
+            // Run an initial update check 5 seconds after boot so it doesn't stall UI initialization
+            Task.Delay(5000).ContinueWith(async _ => 
+            {
+                // Ensure the MessageBox renders on the UI thread
+                if (_trayIcon.ContextMenuStrip != null)
+                {
+                    _trayIcon.ContextMenuStrip.Invoke(new Action(async () => await GitHubAutoUpdater.CheckForUpdatesAsync()));
+                }
+            });
         }
 
         private Icon GenerateCachedIcon(Color color)
@@ -97,6 +116,9 @@ namespace NetworkWatchdog.TrayApp
                 ((ToolStripMenuItem)s!).Checked = _isSilentMode;
             }) { Checked = _isSilentMode };
             menu.Items.Add(silent);
+
+            var checkUpdates = new ToolStripMenuItem("Check for Updates", null, async (s, e) => await GitHubAutoUpdater.CheckForUpdatesAsync(manualCheck: true));
+            menu.Items.Add(checkUpdates);
 
             if (elevated.Count > 0)
             {
@@ -167,7 +189,6 @@ namespace NetworkWatchdog.TrayApp
         {
             try
             {
-                // Connect strictly to the unprivileged Telemetry pipe
                 using var pipeClient = new NamedPipeClientStream(".", "NetworkWatchdogTelemetry", PipeDirection.InOut);
                 pipeClient.Connect(1000);
 
@@ -189,7 +210,6 @@ namespace NetworkWatchdog.TrayApp
         {
             try
             {
-                // Connect strictly to the elevated Control pipe
                 using var pipeClient = new NamedPipeClientStream(".", "NetworkWatchdogControl", PipeDirection.InOut);
                 pipeClient.Connect(300);
 
@@ -267,10 +287,103 @@ namespace NetworkWatchdog.TrayApp
         private void Exit()
         {
             _timer.Stop();
+            _updateTimer.Stop();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
             _dashboardForm?.Close();
             Application.Exit();
+        }
+    }
+
+    public static class GitHubAutoUpdater
+    {
+        private const string RepoOwner = "DiegoUA";
+        private const string RepoName = "NetworkWatchdog";
+        private const string CurrentVersion = "v3.6.0"; // The assembly version compiled into this binary
+
+        public static async Task CheckForUpdatesAsync(bool manualCheck = false)
+        {
+            try
+            {
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkWatchdog-AutoUpdater/1.0");
+                
+                string url = $"https://api.github.com/repos/{RepoOwner}/{RepoName}/releases/latest";
+                string json = await client.GetStringAsync(url);
+                
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                string latestVersion = root.GetProperty("tag_name").GetString() ?? "";
+                
+                // Compare semantic versions
+                if (string.Compare(latestVersion, CurrentVersion, StringComparison.OrdinalIgnoreCase) > 0)
+                {
+                    string downloadUrl = "";
+                    foreach (var asset in root.GetProperty("assets").EnumerateArray())
+                    {
+                        string name = asset.GetProperty("name").GetString() ?? "";
+                        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            downloadUrl = asset.GetProperty("browser_download_url").GetString() ?? "";
+                            break;
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(downloadUrl))
+                    {
+                        var result = MessageBox.Show(
+                            $"A new version of NetworkWatchdog ({latestVersion}) is available on GitHub.\n\n" +
+                            $"Would you like to download and install it now? This will briefly restart the background service.", 
+                            "NetworkWatchdog Update Available", 
+                            MessageBoxButtons.YesNo, 
+                            MessageBoxIcon.Information);
+                            
+                        if (result == DialogResult.Yes)
+                        {
+                            await DownloadAndInstallAsync(client, downloadUrl);
+                        }
+                    }
+                }
+                else if (manualCheck)
+                {
+                    MessageBox.Show("You are running the latest version of NetworkWatchdog.", "Up to Date", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (manualCheck)
+                {
+                    MessageBox.Show($"Failed to check GitHub for updates:\n{ex.Message}", "Update Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        private static async Task DownloadAndInstallAsync(HttpClient client, string downloadUrl)
+        {
+            try
+            {
+                string tempFile = Path.Combine(Path.GetTempPath(), "NetworkWatchdog_Installer.exe");
+                
+                // Download the asset
+                byte[] fileBytes = await client.GetByteArrayAsync(downloadUrl);
+                await File.WriteAllBytesAsync(tempFile, fileBytes);
+
+                // Run the InnoSetup installer silently
+                var psi = new ProcessStartInfo
+                {
+                    FileName = tempFile,
+                    Arguments = "/SILENT",
+                    UseShellExecute = true
+                };
+                Process.Start(psi);
+                
+                // Exit current Tray App so the installer can overwrite the binary
+                Application.Exit();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Auto-Update failed during download/execution:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
     }
 
