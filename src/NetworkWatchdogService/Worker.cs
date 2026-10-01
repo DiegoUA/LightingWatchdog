@@ -66,7 +66,7 @@ namespace NetworkWatchdogService
             _logger.LogInformation("Starting NetworkWatchdogService Worker...");
 
             LoadStateFromDisk();
-            ResyncGlobalBaseline();
+            SafeResyncGlobalBaseline("startup");
 
             _ = Task.Run(() => ProcessEtwChannelAsync(stoppingToken), stoppingToken);
             _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
@@ -136,20 +136,33 @@ namespace NetworkWatchdogService
 
         private async Task ProcessEtwChannelAsync(CancellationToken token)
         {
+            // Runs as an unobserved fire-and-forget Task, same as
+            // ResyncGlobalBaseline did before SafeResyncGlobalBaseline existed:
+            // one exception would otherwise kill ETW processing silently and
+            // permanently for the life of the process. The per-event try/catch
+            // below means a single bad event can't take down processing of
+            // every event after it; the outer catch handles normal shutdown.
             try
             {
                 await foreach (var evt in _etwChannel.Reader.ReadAllAsync(token))
                 {
-                    lock (_connectionCountsLock)
+                    try
                     {
-                        if (evt.IsConnect)
+                        lock (_connectionCountsLock)
                         {
-                            _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 1, (_, count) => count + 1);
+                            if (evt.IsConnect)
+                            {
+                                _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 1, (_, count) => count + 1);
+                            }
+                            else
+                            {
+                                _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 0, (_, count) => Math.Max(0, count - 1));
+                            }
                         }
-                        else
-                        {
-                            _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 0, (_, count) => Math.Max(0, count - 1));
-                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to apply ETW connection-count update for PID {pid}; continuing with the next event.", evt.ProcessId);
                     }
                 }
             }
@@ -161,7 +174,35 @@ namespace NetworkWatchdogService
             while (!token.IsCancellationRequested)
             {
                 await Task.Delay(TimeSpan.FromSeconds(60), token);
+                SafeResyncGlobalBaseline("periodic");
+            }
+        }
+
+        /// <summary>
+        /// Neither call site for ResyncGlobalBaseline used to catch exceptions.
+        /// From the startup path, an unhandled exception in ExecuteAsync is
+        /// fatal to a BackgroundService by default - it would take the whole
+        /// service down. From this loop, which runs as an unobserved
+        /// fire-and-forget Task, one exception kills the loop silently and
+        /// permanently: no crash, no log, resync just never runs again for the
+        /// rest of the process's life, and _pidConnectionCounts is left to
+        /// drift on ETW deltas alone - which is indistinguishable from "the
+        /// fetch logic has a bug" from the outside, even when it doesn't.
+        /// This wrapper exists specifically so that whatever IS actually
+        /// throwing gets logged with a full stack trace instead of silently
+        /// taking resync down, so the real cause (whatever it turns out to be)
+        /// is visible instead of guessed at.
+        /// </summary>
+        private void SafeResyncGlobalBaseline(string trigger)
+        {
+            try
+            {
                 ResyncGlobalBaseline();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "ResyncGlobalBaseline threw and was about to silently kill baseline resync for the rest of the process's life (trigger: {trigger}). " +
+                    "Connection counts will now drift on ETW deltas alone until the service restarts.", trigger);
             }
         }
 
@@ -743,18 +784,39 @@ namespace NetworkWatchdogService
 
         private void StartEtwSession(CancellationToken stoppingToken)
         {
-            if (!(TraceEventSession.IsElevated() ?? false)) return;
-            if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
+            // Also runs as an unobserved fire-and-forget Task. Source.Process()
+            // blocks for the life of the session, so if anything here throws
+            // (including mid-session, from inside Process()), ETW processing
+            // stops silently and permanently - no more AFD events reach
+            // _etwChannel at all. SafeResyncGlobalBaseline now re-corrects
+            // _pidConnectionCounts from the native table every 60s regardless,
+            // so this dying no longer breaks detection the way it used to, but
+            // logging it means you can tell "ETW died, resync carried us" apart
+            // from "everything is fine" instead of them looking identical.
+            try
             {
-                using var oldSession = new TraceEventSession("LightingWatchdogSession");
-                oldSession.Stop();
+                if (!(TraceEventSession.IsElevated() ?? false))
+                {
+                    _logger.LogCritical("ETW session was not started: process is not elevated. Leak detection is running on native-table resync only (every 60s), not live ETW deltas.");
+                    return;
+                }
+                if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
+                {
+                    using var oldSession = new TraceEventSession("LightingWatchdogSession");
+                    oldSession.Stop();
+                }
+                using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
+                {
+                    using var reg = stoppingToken.Register(() => { _etwSession?.Stop(); _etwSession?.Dispose(); });
+                    _etwSession.Source.Dynamic.All += HandleAfdEvent;
+                    _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
+                    _etwSession.Source.Process(); // blocks until Stop()
+                }
             }
-            using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
+            catch (Exception ex)
             {
-                using var reg = stoppingToken.Register(() => { _etwSession?.Stop(); _etwSession?.Dispose(); });
-                _etwSession.Source.Dynamic.All += HandleAfdEvent;
-                _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-                _etwSession.Source.Process();
+                _logger.LogCritical(ex, "ETW session processing stopped unexpectedly. Live connect/close deltas are no longer being tracked; " +
+                    "leak detection now depends entirely on the 60s native-table resync until the service restarts.");
             }
         }
 
