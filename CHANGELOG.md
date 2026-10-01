@@ -14,6 +14,8 @@ All notable changes to LightingWatchdog are documented here.
 - **Precise Threshold Constraints:** Paired a `NumericUpDown` input box seamlessly with the `Global Max TCP/UDP Connections` slider.
 - **UI Noise Filtration:** Hard-filtered any system process exhibiting fewer than `30` total sockets to declutter the "Live Processes" grid.
 - **Application Icon:** Embedded a native `app.ico` into the TrayApp binary.
+- **Diagnostic Build Markers:** Added a hardcoded `BuildMarker` field to the IPC `TelemetryPacket` and root startup logs to definitively verify CI/CD deployment parity and rule out Windows executable locking issues.
+- **Lowered Diagnostic Threshold:** Lowered the `ResyncGlobalBaseline` native tracking log threshold to `50` rows to grant better visibility into the native OS table fetching accuracy vs live ETW handle deltas.
 
 ### Fixed
 
@@ -24,6 +26,7 @@ All notable changes to LightingWatchdog are documented here.
 - **UI Thread Freezing:** Resolved a severe 1-2 second application hang inside the Tray Dashboard. The crash occurred because the UI serialization layer was attempting to read the names of fast-dying background processes, triggering computationally expensive `ArgumentException` unwinding loops. Dead PIDs are now safely cached as `"Terminated"` and instantly bypassed.
 - **Auto-Updater API Mismatch:** Corrected the OTA updater target from `NetworkWatchdog` to `LightingWatchdog` to resolve 404 Not Found API errors.
 - **TrayApp Silent Crash:** Enforced `/p:PublishSingleFile=true` in the GitHub Actions deployment pipeline for the TrayApp to prevent runtime crashes caused by orphaned framework libraries.
+- **Silent Background Task Annihilation:** Resolved a critical flaw where unobserved `Task.Run` background threads (specifically the ETW parser and the periodic 60s native table synchronizer) would encounter a transient exception and permanently, silently crash. Because the sync loop died, the application drifted exclusively on live ETW deltas, completely missing persistent `TIME_WAIT` sockets and falsely reporting low socket counts. Defense-in-depth `try/catch` boundaries have been instituted across all core background tasks, guaranteeing the synchronization loops survive transient errors and continue executing indefinitely.
 
 ## [3.5.3] - 2026-09-28
 
