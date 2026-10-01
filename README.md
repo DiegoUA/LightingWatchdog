@@ -1,6 +1,19 @@
 # NetworkWatchdogService
 
-Advanced Windows network diagnostic and self-healing watchdog for socket leaks, runaway connection storms, and kernel memory pressure. (Formerly LightingWatchdog).
+Advanced Windows network diagnostic and self-healing watchdog for socket leaks, runaway connection storms, and kernel memory pressure. (Formerly LightingWatchdog)
+
+---
+
+## ⚠️ Troubleshooting "Windows Protected Your PC"
+
+Because this tool interacts with native system services and ETW telemetry, Microsoft Defender SmartScreen may flag the `.exe` as an "Unknown Publisher" upon your first download.
+
+To permanently allow the installer to run:
+
+1. Right-click `NetworkWatchdog_Installer.exe` and select **Properties**.
+2. At the bottom of the **General** tab, check the box that says **Unblock**.
+3. Click **Apply** and **OK**.
+4. You can now run the installer normally.
 
 ---
 

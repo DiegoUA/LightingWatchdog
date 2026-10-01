@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Management;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -20,6 +21,16 @@ namespace NetworkWatchdogService
 {
     public class Worker : BackgroundService
     {
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
+
+        private const int AF_INET = 2;
+        private const int AF_INET6 = 23;
+        private const uint ERROR_INSUFFICIENT_BUFFER = 122;
+
         private readonly ILogger<Worker> _logger;
         private TraceEventSession? _etwSession;
         
@@ -55,7 +66,7 @@ namespace NetworkWatchdogService
             _logger.LogInformation("Starting NetworkWatchdogService Worker...");
 
             LoadStateFromDisk();
-            await ResyncGlobalBaselineAsync(stoppingToken);
+            ResyncGlobalBaseline();
 
             _ = Task.Run(() => ProcessEtwChannelAsync(stoppingToken), stoppingToken);
             _ = Task.Run(() => StartEtwSession(stoppingToken), stoppingToken);
@@ -150,57 +161,74 @@ namespace NetworkWatchdogService
             while (!token.IsCancellationRequested)
             {
                 await Task.Delay(TimeSpan.FromSeconds(60), token);
-                await ResyncGlobalBaselineAsync(token);
+                ResyncGlobalBaseline();
             }
         }
 
-        private async Task<Dictionary<int, int>> GetNativeConnectionCountsAsync(CancellationToken token)
+        private Dictionary<int, int> GetNativeConnectionCounts()
         {
             var counts = new Dictionary<int, int>();
-            try
+            
+            void FetchNative(bool isUdp, int ipVersion, int pidOffset, int rowSize)
             {
-                var psi = new ProcessStartInfo
+                int bufferSize = 0;
+                if (isUdp) GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, 1, 0); // UDP_TABLE_OWNER_PID
+                else GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, 5, 0); // TCP_TABLE_OWNER_PID_ALL
+
+                if (bufferSize == 0) return;
+
+                bufferSize += 100000; // 100KB padding to defeat TOCTOU race condition
+                IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
+                
+                try
                 {
-                    FileName = Path.Combine(Environment.SystemDirectory, "netstat.exe"),
-                    Arguments = "-ano",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                    uint result = isUdp 
+                        ? GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, 1, 0)
+                        : GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, 5, 0);
 
-                using var proc = Process.Start(psi);
-                if (proc == null) return counts;
-
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                cts.CancelAfter(5000); 
-
-                string output = await proc.StandardOutput.ReadToEndAsync(cts.Token);
-
-                var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var line in lines)
-                {
-                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length >= 4)
+                    if (result == 0)
                     {
-                        string pidStr = parts[^1].Trim();
-                        if (int.TryParse(pidStr, out int pid) && pid > 4)
+                        int rowCount = Marshal.ReadInt32(tablePtr);
+                        IntPtr rowPtr = tablePtr + 4; // Skip the row count header
+                        
+                        // Handle 64-bit struct padding explicitly
+                        if (ipVersion == AF_INET6 && !isUdp && IntPtr.Size == 8)
                         {
-                            counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
+                            rowPtr = tablePtr + 8; // x64 struct padding offset
+                        }
+
+                        for (int i = 0; i < rowCount; i++)
+                        {
+                            int pid = Marshal.ReadInt32(rowPtr + pidOffset);
+                            if (pid > 4)
+                            {
+                                counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
+                            }
+                            rowPtr += rowSize;
                         }
                     }
                 }
+                finally
+                {
+                    Marshal.FreeHGlobal(tablePtr);
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to parse netstat -ano output.");
-            }
+
+            // TCP IPv4: MIB_TCPTABLE_OWNER_PID
+            FetchNative(false, AF_INET, 20, 24); 
+            // TCP IPv6: MIB_TCP6TABLE_OWNER_PID
+            FetchNative(false, AF_INET6, 52, 56);
+            // UDP IPv4: MIB_UDPTABLE_OWNER_PID
+            FetchNative(true, AF_INET, 8, 12);
+            // UDP IPv6: MIB_UDP6TABLE_OWNER_PID
+            FetchNative(true, AF_INET6, 24, 28);
+
             return counts;
         }
 
-        private async Task ResyncGlobalBaselineAsync(CancellationToken token)
+        private void ResyncGlobalBaseline()
         {
-            _logger.LogInformation("Resyncing socket baselines via native OS netstat...");
-            var counts = await GetNativeConnectionCountsAsync(token);
+            var counts = GetNativeConnectionCounts();
             
             if (counts == null || counts.Count == 0)
             {
@@ -232,10 +260,7 @@ namespace NetworkWatchdogService
 
                 foreach (var kvp in counts)
                 {
-                    if (kvp.Key > 4)
-                    {
-                        _pidConnectionCounts[kvp.Key] = kvp.Value;
-                    }
+                    _pidConnectionCounts[kvp.Key] = kvp.Value;
                 }
 
                 PruneStaleCaches();
@@ -483,7 +508,6 @@ namespace NetworkWatchdogService
                     }
                     catch
                     {
-                        // Safely caches dead PIDs instead of throwing exceptions on every UI refresh
                         procName = $"Terminated (PID {kvp.Key})";
                     }
                     _processNameCache[kvp.Key] = procName;

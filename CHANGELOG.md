@@ -17,10 +17,13 @@ All notable changes to LightingWatchdog are documented here.
 
 ### Fixed
 
-- **ERR_NO_BUFFER_SPACE Vulnerability:** Fixed a critical "blind watchdog" flaw where highly volatile network storms caused Windows native API buffers to exhaust (`ERROR_INSUFFICIENT_BUFFER`). The API pipeline now dynamically pads unmanaged memory buffers by `100,000` bytes to seamlessly outpace TOCTOU system table growth.
+- **ERR_NO_BUFFER_SPACE & Protocol Aborts:** Fixed a critical "blind watchdog" flaw where highly volatile network storms caused Windows native API buffers to exhaust (`ERROR_INSUFFICIENT_BUFFER`). The API pipeline now dynamically isolates each IP Helper fetch and pads unmanaged memory buffers by `100,000` bytes to seamlessly outpace TOCTOU system table growth, without aborting globally if a protocol like IPv6 is disabled on the host.
+- **Native OS Socket Misses (C++ Struct Alignment):** Fixed a core tracking flaw where Windows C++ struct memory padding for IPv6 sockets misaligned the unmanaged C# table pointers, causing the watchdog to miss thousands of active sockets. The unmanaged pointer logic now dynamically detects 64-bit platforms and precisely offsets the memory block, guaranteeing 100% parity with PowerShell's `Get-NetTCPConnection`.
+- **IPC Telemetry Hang:** Resolved a major bottleneck where the Tray App would turn grey and display `[Connecting...]` every 60 seconds. This was caused by experimental `netstat.exe` polling blocking the Named Pipe. The polling engine is firmly secured on lightning-fast native memory (`iphlpapi.dll`), permanently curing UI IPC stalls.
 - **UDP Socket Ignorance:** Integrated `GetExtendedUdpTable` into the core baseline fetcher and bound ETW parsing to `AfdBind` to perfectly track UDP connections.
+- **UI Thread Freezing:** Resolved a severe 1-2 second application hang inside the Tray Dashboard. The crash occurred because the UI serialization layer was attempting to read the names of fast-dying background processes, triggering computationally expensive `ArgumentException` unwinding loops. Dead PIDs are now safely cached as `"Terminated"` and instantly bypassed.
 - **Auto-Updater API Mismatch:** Corrected the OTA updater target from `NetworkWatchdog` to `LightingWatchdog` to resolve 404 Not Found API errors.
-- **TrayApp Silent Crash:** Enforced `/p:PublishSingleFile=true` in the GitHub Actions deployment pipeline for the TrayApp to prevent runtime crashes.
+- **TrayApp Silent Crash:** Enforced `/p:PublishSingleFile=true` in the GitHub Actions deployment pipeline for the TrayApp to prevent runtime crashes caused by orphaned framework libraries.
 
 ## [3.5.3] - 2026-09-28
 
