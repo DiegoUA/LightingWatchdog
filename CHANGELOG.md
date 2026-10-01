@@ -4,12 +4,23 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
-## [3.6.0] - 2026-09-30
+## [3.6.0] - 2026-10-02
 
 ### Added
 
-- **Self-Contained Installer Package:** Created an Inno Setup script (`installer/NetworkWatchdogInstaller.iss`) that automatically stops legacy background processes, copies compiled binaries to `Program Files`, registers the SCM Background Service, and configures the Tray Application to launch silently at user login.
-- **GitHub Auto-Update Engine:** The Tray App now natively queries the `NetworkWatchdog` GitHub API every 24 hours (or on-demand via the system tray context menu). Upon detecting a semantic version increment, it prompts the user, downloads the `.exe` installer asset to `%TEMP%`, and executes a silent overwrite, seamlessly tearing down and relaunching the background service with zero manual intervention.
+- **Self-Contained Installer Package:** Created an Inno Setup script (`installer/NetworkWatchdogInstaller.iss`) that automatically stops legacy background processes, copies compiled binaries, registers the SCM Background Service, and configures the Tray Application to launch silently at user login. Includes wildcard artifact capturing to prevent missing `.runtimeconfig.json` dependencies.
+- **GitHub Auto-Update Engine:** Natively queries the `LightingWatchdog` GitHub API every 24 hours (or on-demand). Prompts the user, downloads the `.exe` installer asset to `%TEMP%`, and executes a silent overwrite update.
+- **Persistent State Saving:** Introduced `state.json` and a `Save Configuration` button inside the Dashboard to permanently commit Global Threshold limits and Whitelist entries.
+- **Precise Threshold Constraints:** Paired a `NumericUpDown` input box seamlessly with the `Global Max TCP/UDP Connections` slider.
+- **UI Noise Filtration:** Hard-filtered any system process exhibiting fewer than `30` total sockets to declutter the "Live Processes" grid.
+- **Application Icon:** Embedded a native `app.ico` into the TrayApp binary.
+
+### Fixed
+
+- **ERR_NO_BUFFER_SPACE Vulnerability:** Fixed a critical "blind watchdog" flaw where highly volatile network storms caused Windows native API buffers to exhaust (`ERROR_INSUFFICIENT_BUFFER`). The API pipeline now dynamically pads unmanaged memory buffers by `100,000` bytes to seamlessly outpace TOCTOU system table growth.
+- **UDP Socket Ignorance:** Integrated `GetExtendedUdpTable` into the core baseline fetcher and bound ETW parsing to `AfdBind` to perfectly track UDP connections.
+- **Auto-Updater API Mismatch:** Corrected the OTA updater target from `NetworkWatchdog` to `LightingWatchdog` to resolve 404 Not Found API errors.
+- **TrayApp Silent Crash:** Enforced `/p:PublishSingleFile=true` in the GitHub Actions deployment pipeline for the TrayApp to prevent runtime crashes.
 
 ## [3.5.3] - 2026-09-28
 

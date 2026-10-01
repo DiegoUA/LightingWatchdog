@@ -30,7 +30,6 @@ namespace NetworkWatchdog.TrayApp
         private readonly NotifyIcon _trayIcon;
         private readonly System.Windows.Forms.Timer _timer;
         private readonly System.Windows.Forms.Timer _updateTimer;
-        private readonly string _csvHealthPath;
         private bool _isSilentMode = false;
         private string _lastRestartEvent = string.Empty;
         private DashboardForm? _dashboardForm;
@@ -46,8 +45,6 @@ namespace NetworkWatchdog.TrayApp
 
         public TrayApplicationContext()
         {
-            _csvHealthPath = @"C:\Users\maksi\OneDrive\Projects\LightingWatchdog\bin\Release\logs\export\HealthTrend_v2.csv";
-
             _iconGreen = GenerateCachedIcon(Color.Green);
             _iconOrange = GenerateCachedIcon(Color.Orange);
             _iconRed = GenerateCachedIcon(Color.Red);
@@ -64,20 +61,16 @@ namespace NetworkWatchdog.TrayApp
             _trayIcon.DoubleClick += (s, e) => ShowDashboard();
             RebuildContextMenu(new List<ProcessTelemetryItem>());
 
-            // Telemetry Polling Timer
             _timer = new System.Windows.Forms.Timer { Interval = 2000 };
             _timer.Tick += (s, e) => PollTelemetry();
             _timer.Start();
 
-            // GitHub Auto-Updater Timer (Checks every 24 hours)
             _updateTimer = new System.Windows.Forms.Timer { Interval = 86400000 };
             _updateTimer.Tick += async (s, e) => await GitHubAutoUpdater.CheckForUpdatesAsync();
             _updateTimer.Start();
 
-            // Run an initial update check 5 seconds after boot so it doesn't stall UI initialization
             Task.Delay(5000).ContinueWith(async _ => 
             {
-                // Ensure the MessageBox renders on the UI thread
                 if (_trayIcon.ContextMenuStrip != null)
                 {
                     _trayIcon.ContextMenuStrip.Invoke(new Action(async () => await GitHubAutoUpdater.CheckForUpdatesAsync()));
@@ -181,7 +174,8 @@ namespace NetworkWatchdog.TrayApp
             }
             else
             {
-                FallbackFilePolling();
+                _trayIcon.Icon = _iconGray;
+                _trayIcon.Text = "NetworkWatchdog [Connecting...]";
             }
         }
 
@@ -262,28 +256,6 @@ namespace NetworkWatchdog.TrayApp
             }
         }
 
-        private void FallbackFilePolling()
-        {
-            try
-            {
-                if (!File.Exists(_csvHealthPath)) return;
-                var lines = File.ReadLines(_csvHealthPath).TakeLast(50).ToList();
-                if (lines.Count <= 1) return;
-
-                var valid = lines.Skip(1).Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("Timestamp")).ToList();
-                if (valid.Count == 0) return;
-
-                string lastLine = valid.Last();
-                var parts = lastLine.Split(',');
-                if (parts.Length >= 4 && int.TryParse(parts[3], out int conn))
-                {
-                    _trayIcon.Icon = conn < 500 ? _iconGreen : (conn < 1000 ? _iconOrange : _iconRed);
-                    _trayIcon.Text = $"NetworkWatchdog [File Fallback]\n{parts[1]} (PID {parts[2]}): {conn} sockets";
-                }
-            }
-            catch { }
-        }
-
         private void Exit()
         {
             _timer.Stop();
@@ -298,8 +270,8 @@ namespace NetworkWatchdog.TrayApp
     public static class GitHubAutoUpdater
     {
         private const string RepoOwner = "DiegoUA";
-        private const string RepoName = "NetworkWatchdog";
-        private const string CurrentVersion = "v3.6.0"; // The assembly version compiled into this binary
+        private const string RepoName = "LightingWatchdog"; 
+        private const string CurrentVersion = "v3.6.0"; 
 
         public static async Task CheckForUpdatesAsync(bool manualCheck = false)
         {
@@ -315,7 +287,6 @@ namespace NetworkWatchdog.TrayApp
                 var root = doc.RootElement;
                 string latestVersion = root.GetProperty("tag_name").GetString() ?? "";
                 
-                // Compare semantic versions
                 if (string.Compare(latestVersion, CurrentVersion, StringComparison.OrdinalIgnoreCase) > 0)
                 {
                     string downloadUrl = "";
@@ -364,11 +335,9 @@ namespace NetworkWatchdog.TrayApp
             {
                 string tempFile = Path.Combine(Path.GetTempPath(), "NetworkWatchdog_Installer.exe");
                 
-                // Download the asset
                 byte[] fileBytes = await client.GetByteArrayAsync(downloadUrl);
                 await File.WriteAllBytesAsync(tempFile, fileBytes);
 
-                // Run the InnoSetup installer silently
                 var psi = new ProcessStartInfo
                 {
                     FileName = tempFile,
@@ -377,7 +346,6 @@ namespace NetworkWatchdog.TrayApp
                 };
                 Process.Start(psi);
                 
-                // Exit current Tray App so the installer can overwrite the binary
                 Application.Exit();
             }
             catch (Exception ex)
@@ -396,7 +364,7 @@ namespace NetworkWatchdog.TrayApp
         private readonly DataGridView _gridRestarts;
         private readonly ListBox _listWhitelist;
         private readonly TrackBar _sliderThreshold;
-        private readonly Label _lblSliderValue;
+        private readonly NumericUpDown _numThreshold;
 
         public DashboardForm(Action<int, string> killAction, Func<ConfigUpdateCommand, bool> sendConfigAction)
         {
@@ -443,13 +411,31 @@ namespace NetworkWatchdog.TrayApp
             var tabSettings = new TabPage("Settings & Whitelist");
             var pnlSettings = new Panel { Dock = DockStyle.Fill, Padding = new Padding(15) };
 
-            var lblThresh = new Label { Text = "Global Max TCP Connections Threshold:", Top = 15, Left = 15, Width = 300 };
-            _sliderThreshold = new TrackBar { Top = 40, Left = 15, Width = 400, Minimum = 500, Maximum = 5000, TickFrequency = 250, SmallChange = 50, LargeChange = 250 };
-            _lblSliderValue = new Label { Text = "1500", Top = 45, Left = 425, Width = 60 };
+            var lblThresh = new Label { Text = "Global Max TCP/UDP Connections Threshold:", Top = 15, Left = 15, Width = 300 };
+            
+            _sliderThreshold = new TrackBar { Top = 40, Left = 15, Width = 300, Minimum = 200, Maximum = 10000, TickFrequency = 250, SmallChange = 50, LargeChange = 250 };
+            _numThreshold = new NumericUpDown { Top = 40, Left = 330, Width = 80, Minimum = 200, Maximum = 10000 };
+            var btnSaveConfig = new Button { Text = "Save Configuration", Top = 38, Left = 430, Width = 150 };
+
             _sliderThreshold.ValueChanged += (s, e) =>
             {
-                _lblSliderValue.Text = _sliderThreshold.Value.ToString();
+                if (_numThreshold.Value != _sliderThreshold.Value)
+                    _numThreshold.Value = _sliderThreshold.Value;
                 _sendConfigAction(new ConfigUpdateCommand { NewGlobalThreshold = _sliderThreshold.Value });
+            };
+
+            _numThreshold.ValueChanged += (s, e) =>
+            {
+                if (_sliderThreshold.Value != (int)_numThreshold.Value)
+                    _sliderThreshold.Value = (int)_numThreshold.Value;
+            };
+
+            btnSaveConfig.Click += (s, e) =>
+            {
+                if (_sendConfigAction(new ConfigUpdateCommand { SaveRequested = true }))
+                {
+                    MessageBox.Show("Configuration successfully saved to disk.\n\nThresholds and Whitelist will persist across system reboots.", "Configuration Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
             };
 
             var lblWhite = new Label { Text = "Excluded / Whitelisted Processes (Bypass Auto-Kill):", Top = 90, Left = 15, Width = 350 };
@@ -483,7 +469,7 @@ namespace NetworkWatchdog.TrayApp
                 }
             };
 
-            pnlSettings.Controls.AddRange(new Control[] { lblThresh, _sliderThreshold, _lblSliderValue, lblWhite, _listWhitelist, txtNewItem, btnAdd, btnRemove });
+            pnlSettings.Controls.AddRange(new Control[] { lblThresh, _sliderThreshold, _numThreshold, btnSaveConfig, lblWhite, _listWhitelist, txtNewItem, btnAdd, btnRemove });
             tabSettings.Controls.Add(pnlSettings);
 
             _tabs.TabPages.AddRange(new[] { tabProcesses, tabRestarts, tabSettings });
@@ -508,10 +494,10 @@ namespace NetworkWatchdog.TrayApp
                 }
             }
 
-            if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum)
+            if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum && packet.GlobalMaxTcpConnections <= _sliderThreshold.Maximum)
             {
                 _sliderThreshold.Value = packet.GlobalMaxTcpConnections;
-                _lblSliderValue.Text = packet.GlobalMaxTcpConnections.ToString();
+                _numThreshold.Value = packet.GlobalMaxTcpConnections;
             }
 
             if (_listWhitelist.Items.Count != packet.Whitelist.Count)
@@ -547,5 +533,6 @@ namespace NetworkWatchdog.TrayApp
         public int? NewGlobalThreshold { get; set; }
         public string? AddWhitelist { get; set; }
         public string? RemoveWhitelist { get; set; }
+        public bool? SaveRequested { get; set; }
     }
 }

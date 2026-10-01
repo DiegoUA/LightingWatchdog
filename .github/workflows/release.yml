@@ -25,7 +25,8 @@ jobs:
         run: dotnet publish src/NetworkWatchdogService/NetworkWatchdogService.csproj -r win-x64 -c Release /p:PublishSingleFile=true -o out\service
 
       - name: Publish Tray Application (win-x64)
-        run: dotnet publish src/NetworkWatchdog.TrayApp/NetworkWatchdog.TrayApp.csproj -r win-x64 -c Release -o out\tray
+        # Added /p:PublishSingleFile=true to prevent the silent dependency crash
+        run: dotnet publish src/NetworkWatchdog.TrayApp/NetworkWatchdog.TrayApp.csproj -r win-x64 -c Release /p:PublishSingleFile=true -o out\tray
 
       - name: Compile Inno Setup Installer
         run: |

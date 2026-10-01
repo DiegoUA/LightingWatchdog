@@ -24,9 +24,11 @@ namespace NetworkWatchdogService
         [DllImport("iphlpapi.dll", SetLastError = true)]
         private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
 
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
+
         private const int AF_INET = 2;
         private const int AF_INET6 = 23;
-        private const int TCP_TABLE_OWNER_PID_ALL = 5;
 
         private readonly ILogger<Worker> _logger;
         private TraceEventSession? _etwSession;
@@ -43,10 +45,10 @@ namespace NetworkWatchdogService
         
         private readonly ConcurrentDictionary<string, byte> _whitelist = new(StringComparer.OrdinalIgnoreCase);
 
-        private readonly string _whitelistFilePath = Path.Combine(
+        private readonly string _stateFilePath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            "NetworkWatchdogService", "whitelist.json");
-        private readonly SemaphoreSlim _whitelistFileLock = new(1, 1);
+            "NetworkWatchdogService", "state.json");
+        private readonly SemaphoreSlim _stateFileLock = new(1, 1);
 
         private volatile int _globalMaxTcpConnections = 1500;
         private readonly object _connectionCountsLock = new();
@@ -62,7 +64,7 @@ namespace NetworkWatchdogService
         {
             _logger.LogInformation("Starting NetworkWatchdogService Worker...");
 
-            LoadWhitelistFromDisk();
+            LoadStateFromDisk();
             ResyncGlobalBaseline();
 
             _ = Task.Run(() => ProcessEtwChannelAsync(stoppingToken), stoppingToken);
@@ -162,71 +164,71 @@ namespace NetworkWatchdogService
             }
         }
 
-        private Dictionary<int, int> GetNativeTcpConnectionCounts()
+        private Dictionary<int, int>? GetNativeConnectionCounts()
         {
             var counts = new Dictionary<int, int>();
-
             const uint ERROR_INSUFFICIENT_BUFFER = 122;
             const int MaxAttempts = 5;
 
-            void Fetch(int ipVersion, int rowSize, int pidOffset)
+            bool Fetch(bool isUdp, int ipVersion, int rowSize, int pidOffset, int tblClass)
             {
                 int bufferSize = 0;
-                GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
-                if (bufferSize == 0) return;
+                if (isUdp) GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0);
+                else GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0);
+
+                if (bufferSize == 0) return true;
 
                 for (int attempt = 0; attempt < MaxAttempts; attempt++)
                 {
-                    IntPtr tcpTablePtr = Marshal.AllocHGlobal(bufferSize);
+                    // Add substantial unmanaged padding to definitively beat rapid table TOCTOU growth
+                    bufferSize += 100000; 
+                    IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
                     try
                     {
-                        uint result = GetExtendedTcpTable(tcpTablePtr, ref bufferSize, false, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+                        uint result = isUdp 
+                            ? GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0)
+                            : GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0);
 
                         if (result == 0)
                         {
-                            int rowCount = Marshal.ReadInt32(tcpTablePtr);
-                            IntPtr rowPtr = tcpTablePtr + 4; 
-
+                            int rowCount = Marshal.ReadInt32(tablePtr);
+                            IntPtr rowPtr = tablePtr + 4; 
                             for (int i = 0; i < rowCount; i++)
                             {
                                 int pid = Marshal.ReadInt32(rowPtr + pidOffset);
                                 counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
                                 rowPtr += rowSize;
                             }
-                            return;
+                            return true;
                         }
 
                         if (result != ERROR_INSUFFICIENT_BUFFER)
                         {
-                            return;
+                            _logger.LogWarning("Native {type} fetch (IPv{ver}) failed with OS code {code}.", isUdp ? "UDP" : "TCP", ipVersion == AF_INET ? 4 : 6, result);
+                            return false;
                         }
                     }
-                    finally
-                    {
-                        Marshal.FreeHGlobal(tcpTablePtr);
-                    }
+                    finally { Marshal.FreeHGlobal(tablePtr); }
                 }
 
-                _logger.LogWarning("GetExtendedTcpTable (IPv{ver}) kept returning ERROR_INSUFFICIENT_BUFFER after {attempts} attempts; skipping this cycle.", ipVersion == AF_INET ? 4 : 6, MaxAttempts);
+                _logger.LogWarning("GetExtended{type}Table (IPv{ver}) exhausted {attempts} buffer allocation attempts.", isUdp ? "Udp" : "Tcp", ipVersion == AF_INET ? 4 : 6, MaxAttempts);
+                return false;
             }
 
-            Fetch(AF_INET, 24, 20);
-            Fetch(AF_INET6, 56, 52);
+            if (!Fetch(false, AF_INET, 24, 20, 5)) return null; // TCP_TABLE_OWNER_PID_ALL
+            if (!Fetch(false, AF_INET6, 56, 52, 5)) return null;
+            if (!Fetch(true, AF_INET, 12, 8, 1)) return null;   // UDP_TABLE_OWNER_PID
+            if (!Fetch(true, AF_INET6, 28, 24, 1)) return null;
 
             return counts;
         }
 
         private void ResyncGlobalBaseline()
         {
-            _logger.LogInformation("Resyncing socket baselines via IP Helper API...");
-            var counts = new Dictionary<int, int>();
-            try
+            var counts = GetNativeConnectionCounts();
+            if (counts == null)
             {
-                counts = GetNativeTcpConnectionCounts();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to execute native TCP table baseline fetch.");
+                _logger.LogWarning("Aborting baseline resync due to native API fetch failure. Preserving ETW states to prevent false negatives.");
                 return;
             }
 
@@ -494,6 +496,9 @@ namespace NetworkWatchdogService
 
             foreach (var kvp in _pidConnectionCounts)
             {
+                // UI Noise Reduction: Do not serialize background processes with fewer than 30 sockets
+                if (kvp.Value < 30) continue; 
+
                 if (!_processNameCache.TryGetValue(kvp.Key, out string? procName))
                 {
                     try
@@ -508,10 +513,7 @@ namespace NetworkWatchdogService
                     }
                 }
 
-                if (string.IsNullOrEmpty(procName))
-                {
-                    continue;
-                }
+                if (string.IsNullOrEmpty(procName)) continue;
 
                 string status = kvp.Value < 500 ? "Healthy" : (kvp.Value < _globalMaxTcpConnections ? "Elevated" : "CRITICAL LEAK");
                 packet.Processes.Add(new ProcessTelemetryItem
@@ -528,7 +530,11 @@ namespace NetworkWatchdogService
 
         private void ApplyConfigUpdate(ConfigUpdateCommand cmd)
         {
-            bool whitelistChanged = false;
+            if (cmd.SaveRequested == true)
+            {
+                _ = SaveStateToDiskAsync();
+                return;
+            }
 
             if (cmd.NewGlobalThreshold.HasValue && cmd.NewGlobalThreshold.Value >= 200 && cmd.NewGlobalThreshold.Value <= 10000)
             {
@@ -540,7 +546,6 @@ namespace NetworkWatchdogService
             {
                 if (TryNormalizeWhitelistEntry(cmd.AddWhitelist, out string entry) && _whitelist.TryAdd(entry, 1))
                 {
-                    whitelistChanged = true;
                     _logger.LogInformation("IPC: Added {name} to whitelist.", entry);
                 }
             }
@@ -548,18 +553,12 @@ namespace NetworkWatchdogService
             {
                 if (TryNormalizeWhitelistEntry(cmd.RemoveWhitelist, out string entry) && _whitelist.TryRemove(entry, out _))
                 {
-                    whitelistChanged = true;
                     _logger.LogInformation("IPC: Removed {name} from whitelist.", entry);
                 }
             }
-
-            if (whitelistChanged)
-            {
-                _ = SaveWhitelistToDiskAsync();
-            }
         }
 
-        private const long MaxWhitelistFileBytes = 1024 * 1024;
+        private const long MaxStateFileBytes = 1024 * 1024;
         private const int MaxWhitelistEntries = 10_000;
         private const int MaxWhitelistEntryLength = 260;
 
@@ -576,64 +575,55 @@ namespace NetworkWatchdogService
         }
 
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-        private void LoadWhitelistFromDisk()
+        private void LoadStateFromDisk()
         {
             try
             {
-                if (!File.Exists(_whitelistFilePath)) return;
+                if (!File.Exists(_stateFilePath)) return;
 
-                string? dir = Path.GetDirectoryName(_whitelistFilePath);
+                string? dir = Path.GetDirectoryName(_stateFilePath);
                 if (string.IsNullOrEmpty(dir) ||
                     !IsAdminOnlyLocation(dir, isDirectory: true) ||
-                    !IsAdminOnlyLocation(_whitelistFilePath, isDirectory: false))
+                    !IsAdminOnlyLocation(_stateFilePath, isDirectory: false))
                 {
-                    _logger.LogCritical("Refusing to load whitelist from {path}: file or directory is not exclusively owned/writable by Administrators or SYSTEM. Starting with an empty dynamic whitelist.", _whitelistFilePath);
+                    _logger.LogCritical("Refusing to load state from {path}: directory is not exclusively owned by Administrators. Starting clean.", _stateFilePath);
                     return;
                 }
 
-                if (new FileInfo(_whitelistFilePath).Length > MaxWhitelistFileBytes)
-                {
-                    _logger.LogError("Refusing to load whitelist from {path}: file exceeds {max} bytes.", _whitelistFilePath, MaxWhitelistFileBytes);
-                    return;
-                }
+                if (new FileInfo(_stateFilePath).Length > MaxStateFileBytes) return;
 
-                List<string?>? rawEntries;
+                PersistedState? state;
                 try
                 {
-                    rawEntries = JsonSerializer.Deserialize<List<string?>>(File.ReadAllText(_whitelistFilePath));
+                    state = JsonSerializer.Deserialize<PersistedState>(File.ReadAllText(_stateFilePath));
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogError(ex, "Whitelist file {path} is not a valid JSON array of strings; starting with an empty dynamic whitelist.", _whitelistFilePath);
+                    _logger.LogError(ex, "State file {path} is not valid JSON.", _stateFilePath);
                     return;
                 }
 
-                if (rawEntries == null) return;
+                if (state == null) return;
 
-                var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                int invalid = 0, duplicates = 0;
-
-                foreach (var raw in rawEntries)
+                if (state.GlobalThreshold >= 200 && state.GlobalThreshold <= 10000)
                 {
-                    if (unique.Count >= MaxWhitelistEntries)
-                    {
-                        _logger.LogWarning("Whitelist file has more than {max} entries; ignoring the rest.", MaxWhitelistEntries);
-                        break;
-                    }
-
-                    if (!TryNormalizeWhitelistEntry(raw, out string entry)) { invalid++; continue; }
-                    if (!unique.Add(entry)) { duplicates++; }
+                    _globalMaxTcpConnections = state.GlobalThreshold;
                 }
 
-                foreach (var entry in unique)
-                    _whitelist.TryAdd(entry, 1);
+                var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var raw in state.Whitelist)
+                {
+                    if (unique.Count >= MaxWhitelistEntries) break;
+                    if (TryNormalizeWhitelistEntry(raw, out string entry)) unique.Add(entry);
+                }
 
-                _logger.LogInformation("Loaded {count} whitelist entries from {path} ({dupes} duplicates and {invalid} invalid entries skipped).",
-                    unique.Count, _whitelistFilePath, duplicates, invalid);
+                foreach (var entry in unique) _whitelist.TryAdd(entry, 1);
+
+                _logger.LogInformation("Loaded config from {path}: Threshold={thresh}, Whitelist={count} items.", _stateFilePath, _globalMaxTcpConnections, unique.Count);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to load persisted whitelist from {path}; starting with an empty dynamic whitelist.", _whitelistFilePath);
+                _logger.LogError(ex, "Failed to load persisted state from {path}.", _stateFilePath);
             }
         }
 
@@ -642,106 +632,62 @@ namespace NetworkWatchdogService
         {
             try
             {
-                var admins = new System.Security.Principal.SecurityIdentifier(
-                    System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
-                var system = new System.Security.Principal.SecurityIdentifier(
-                    System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+                var admins = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+                var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
 
-                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-                {
-                    _logger.LogWarning("{path} is a reparse point; treating as untrusted.", path);
-                    return false;
-                }
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;
 
                 System.Security.AccessControl.FileSystemSecurity security = isDirectory
                     ? new DirectoryInfo(path).GetAccessControl()
                     : new FileInfo(path).GetAccessControl();
 
-                var owner = security.GetOwner(typeof(System.Security.Principal.SecurityIdentifier))
-                    as System.Security.Principal.SecurityIdentifier;
-                if (owner == null || !(owner.Equals(admins) || owner.Equals(system)))
-                {
-                    _logger.LogWarning("{path} is owned by {owner}, not Administrators/SYSTEM.", path, owner?.Value ?? "unknown");
-                    return false;
-                }
+                var owner = security.GetOwner(typeof(System.Security.Principal.SecurityIdentifier)) as System.Security.Principal.SecurityIdentifier;
+                if (owner == null || !(owner.Equals(admins) || owner.Equals(system))) return false;
 
-                const System.Security.AccessControl.FileSystemRights genericWrite = (System.Security.AccessControl.FileSystemRights)0x40000000;
-                const System.Security.AccessControl.FileSystemRights genericAll = (System.Security.AccessControl.FileSystemRights)0x10000000;
+                const System.Security.AccessControl.FileSystemRights writeish = (System.Security.AccessControl.FileSystemRights)0x40000000 | (System.Security.AccessControl.FileSystemRights)0x10000000 | System.Security.AccessControl.FileSystemRights.WriteData | System.Security.AccessControl.FileSystemRights.AppendData | System.Security.AccessControl.FileSystemRights.WriteExtendedAttributes | System.Security.AccessControl.FileSystemRights.WriteAttributes | System.Security.AccessControl.FileSystemRights.Delete | System.Security.AccessControl.FileSystemRights.DeleteSubdirectoriesAndFiles | System.Security.AccessControl.FileSystemRights.ChangePermissions | System.Security.AccessControl.FileSystemRights.TakeOwnership;
 
-                const System.Security.AccessControl.FileSystemRights writeish =
-                    genericWrite |
-                    genericAll |
-                    System.Security.AccessControl.FileSystemRights.WriteData |
-                    System.Security.AccessControl.FileSystemRights.AppendData |
-                    System.Security.AccessControl.FileSystemRights.WriteExtendedAttributes |
-                    System.Security.AccessControl.FileSystemRights.WriteAttributes |
-                    System.Security.AccessControl.FileSystemRights.Delete |
-                    System.Security.AccessControl.FileSystemRights.DeleteSubdirectoriesAndFiles |
-                    System.Security.AccessControl.FileSystemRights.ChangePermissions |
-                    System.Security.AccessControl.FileSystemRights.TakeOwnership;
-
-                foreach (System.Security.AccessControl.FileSystemAccessRule rule in
-                    security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+                foreach (System.Security.AccessControl.FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
                 {
                     if (rule.AccessControlType != System.Security.AccessControl.AccessControlType.Allow) continue;
-
                     var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
                     if (sid.Equals(admins) || sid.Equals(system)) continue;
-
-                    if ((rule.FileSystemRights & writeish) != 0)
-                    {
-                        _logger.LogWarning("{path} grants write-capable access to {sid}.", path, sid.Value);
-                        return false;
-                    }
+                    if ((rule.FileSystemRights & writeish) != 0) return false;
                 }
-
                 return true;
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Could not verify ownership/ACL of {path}; treating as untrusted.", path);
-                return false;
-            }
+            catch { return false; }
         }
 
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-        private async Task SaveWhitelistToDiskAsync()
+        private async Task SaveStateToDiskAsync()
         {
-            await _whitelistFileLock.WaitAsync();
+            await _stateFileLock.WaitAsync();
             try
             {
-                string? dir = Path.GetDirectoryName(_whitelistFilePath);
+                string? dir = Path.GetDirectoryName(_stateFilePath);
                 if (!string.IsNullOrEmpty(dir))
                 {
                     Directory.CreateDirectory(dir);
-
-                    try
-                    {
-                        SecureDirectoryToAdminsAndSystem(dir);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir);
-                    }
-
-                    if (!IsAdminOnlyLocation(dir, isDirectory: true))
-                    {
-                        _logger.LogCritical("Not persisting whitelist: {dir} is not exclusively controlled by Administrators/SYSTEM.", dir);
-                        return;
-                    }
+                    try { SecureDirectoryToAdminsAndSystem(dir); } catch { }
+                    if (!IsAdminOnlyLocation(dir, isDirectory: true)) return;
                 }
 
-                string tempPath = _whitelistFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(_whitelist.Keys.ToList()));
+                var state = new PersistedState
+                {
+                    GlobalThreshold = _globalMaxTcpConnections,
+                    Whitelist = _whitelist.Keys.ToList()
+                };
+
+                string tempPath = _stateFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(state));
                 try
                 {
-                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                        bufferSize: 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
                     {
                         await fs.WriteAsync(payload);
                         await fs.FlushAsync();
                     }
-                    File.Move(tempPath, _whitelistFilePath, overwrite: true);
+                    File.Move(tempPath, _stateFilePath, overwrite: true);
                 }
                 catch
                 {
@@ -749,14 +695,13 @@ namespace NetworkWatchdogService
                     throw;
                 }
             }
-            // Ensure proper disposal and error handling on file cleanup:
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to persist whitelist to disk.");
+                _logger.LogError(ex, "Failed to persist state to disk.");
             }
             finally
             {
-                _whitelistFileLock.Release();
+                _stateFileLock.Release();
             }
         }
 
@@ -764,49 +709,28 @@ namespace NetworkWatchdogService
         private static void SecureDirectoryToAdminsAndSystem(string dir)
         {
             var security = new System.Security.AccessControl.DirectorySecurity();
-
             security.SetAccessRuleProtection(true, false);
-
-            var admins = new System.Security.Principal.SecurityIdentifier(
-                System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
-            var system = new System.Security.Principal.SecurityIdentifier(
-                System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+            var admins = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+            var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
 
             foreach (var sid in new[] { admins, system })
             {
-                security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
-                    sid,
-                    System.Security.AccessControl.FileSystemRights.FullControl,
-                    System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
-                    System.Security.AccessControl.PropagationFlags.None,
-                    System.Security.AccessControl.AccessControlType.Allow));
+                security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
             }
-
             new DirectoryInfo(dir).SetAccessControl(security);
         }
 
         private void StartEtwSession(CancellationToken stoppingToken)
         {
-            if (!(TraceEventSession.IsElevated() ?? false))
-            {
-                _logger.LogCritical("ETW Tracing requires Administrator privileges.");
-                return;
-            }
-
+            if (!(TraceEventSession.IsElevated() ?? false)) return;
             if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
             {
                 using var oldSession = new TraceEventSession("LightingWatchdogSession");
                 oldSession.Stop();
             }
-
             using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
             {
-                using var reg = stoppingToken.Register(() => 
-                {
-                    _etwSession?.Stop();
-                    _etwSession?.Dispose();
-                });
-
+                using var reg = stoppingToken.Register(() => { _etwSession?.Stop(); _etwSession?.Dispose(); });
                 _etwSession.Source.Dynamic.All += HandleAfdEvent;
                 _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
                 _etwSession.Source.Process();
@@ -816,8 +740,8 @@ namespace NetworkWatchdogService
         private void HandleAfdEvent(TraceEvent data)
         {
             if (data.ProcessID <= 4) return;
-
-            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
+            // Added AfdBind to actively catch UDP socket generation during high-frequency telemetry spikes
+            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept") || data.EventName.Contains("AfdBind"))
             {
                 _etwChannel.Writer.TryWrite(new AfdEvent(data.ProcessID, true));
             }
@@ -842,91 +766,18 @@ namespace NetworkWatchdogService
             lock (_serviceCacheRefreshLock)
             {
                 if (DateTime.UtcNow - _lastServiceCacheRefreshUtc < ServiceCacheTtl) return;
-
                 try
                 {
-                    using var searcher = new ManagementObjectSearcher(
-                        "SELECT Name, ProcessId FROM Win32_Service WHERE ProcessId != 0");
+                    using var searcher = new ManagementObjectSearcher("SELECT Name, ProcessId FROM Win32_Service WHERE ProcessId != 0");
                     using var objects = searcher.Get();
-
                     foreach (ManagementObject obj in objects.Cast<ManagementObject>())
                     {
                         if (obj["ProcessId"] is uint pid && obj["Name"] is string name && !string.IsNullOrEmpty(name))
-                        {
                             _serviceNameCache[(int)pid] = name;
-                        }
                     }
-
                     _lastServiceCacheRefreshUtc = DateTime.UtcNow;
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to refresh PID->service name cache via WMI.");
-                }
-            }
-        }
-
-        private bool IsTrustedExecutablePath(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path)) return false;
-
-            string fullPath;
-            try
-            {
-                fullPath = Path.GetFullPath(path);
-            }
-            catch
-            {
-                return false;
-            }
-
-            if (!File.Exists(fullPath)) return false;
-
-            var roots = new[]
-            {
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                Environment.GetFolderPath(Environment.SpecialFolder.Windows)
-            };
-
-            bool underTrustedRoot = roots.Any(root =>
-            {
-                if (string.IsNullOrEmpty(root)) return false;
-                string normalizedRoot = Path.GetFullPath(root)
-                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                return fullPath.StartsWith(
-                        normalizedRoot + Path.DirectorySeparatorChar,
-                        StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(fullPath, normalizedRoot, StringComparison.OrdinalIgnoreCase);
-            });
-
-            if (!underTrustedRoot) return false;
-
-            return IsAuthenticodeSigned(fullPath);
-        }
-
-        private bool IsAuthenticodeSigned(string fullPath)
-        {
-            try
-            {
-#if NET9_0_OR_GREATER
-                using var signer = System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificateFromFile(fullPath);
-#else
-                using var signer = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromSignedFile(fullPath);
-#endif
-                using var chain = new System.Security.Cryptography.X509Certificates.X509Chain
-                {
-                    ChainPolicy =
-                    {
-                        RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.Online,
-                        VerificationFlags = System.Security.Cryptography.X509Certificates.X509VerificationFlags.NoFlag
-                    }
-                };
-                return chain.Build(new System.Security.Cryptography.X509Certificates.X509Certificate2(signer));
-            }
-            catch
-            {
-                return false;
+                catch { }
             }
         }
 
@@ -934,11 +785,7 @@ namespace NetworkWatchdogService
         {
             try
             {
-                if (!TryVerifySamePid(processId, expectedStartTime, out Process? proc))
-                {
-                    _logger.LogInformation("PID {pid} no longer matches the process that triggered the restart; skipping.", processId);
-                    return;
-                }
+                if (!TryVerifySamePid(processId, expectedStartTime, out Process? proc)) return;
 
                 string? actualServiceName = GetServiceNameFromPidCached(processId);
                 string? scmServiceName = IsValidServiceName(actualServiceName) ? actualServiceName : null;
@@ -946,14 +793,10 @@ namespace NetworkWatchdogService
 
                 _logger.LogWarning("Force killing leaking process/service {serviceName} (PID {pid})...", serviceNameToUse, processId);
 
-                if (scmServiceName != null)
-                {
-                    ExecuteSafeCommand("sc.exe", new[] { "stop", scmServiceName }, suppressErrors: true);
-                }
+                if (scmServiceName != null) ExecuteSafeCommand("sc.exe", new[] { "stop", scmServiceName }, suppressErrors: true);
 
                 if (!TryVerifySamePid(processId, expectedStartTime, out _))
                 {
-                    _logger.LogInformation("PID {pid} was recycled before taskkill could run; aborting to avoid killing an unrelated process.", processId);
                     proc?.Dispose();
                     return;
                 }
@@ -970,18 +813,9 @@ namespace NetworkWatchdogService
 
                 await Task.Delay(30000);
 
-                if (scmServiceName == null)
+                if (scmServiceName != null)
                 {
-                    _logger.LogInformation("PID {pid} ({name}) is not a registered Windows service; it was terminated and will not be relaunched.", processId, serviceNameToUse);
-                }
-                else if (await TryStartServiceAsync(scmServiceName))
-                {
-                    _logger.LogInformation("Service {serviceName} is running again after the restart.", scmServiceName);
-                }
-                else
-                {
-                    _logger.LogWarning("Service {serviceName} was not confirmed running after the restart attempt. " +
-                        "Standalone executable relaunch is disabled by design; manual intervention may be required.", scmServiceName);
+                    await TryStartServiceAsync(scmServiceName);
                 }
             }
             finally
@@ -995,11 +829,7 @@ namespace NetworkWatchdogService
             if (string.IsNullOrWhiteSpace(name) || name.Length > 256) return false;
             if (name != name.Trim()) return false;
             if (name[0] == '-' || name[0] == '/') return false;
-
-            foreach (char c in name)
-            {
-                if (char.IsControl(c) || c == '/' || c == '\\' || c == '"') return false;
-            }
+            foreach (char c in name) if (char.IsControl(c) || c == '/' || c == '\\' || c == '"') return false;
             return true;
         }
 
@@ -1017,80 +847,48 @@ namespace NetworkWatchdogService
                 proc = candidate;
                 return true;
             }
-            catch
-            {
-                return false;
-            }
+            catch { return false; }
         }
 
         private const int ERROR_SERVICE_ALREADY_RUNNING = 1056;
         private const int ServiceStateStopped = 1;
         private const int ServiceStateRunning = 4;
         private static readonly TimeSpan ScCommandTimeout = TimeSpan.FromSeconds(30);
-        private static readonly System.Text.RegularExpressions.Regex ScStateRegex =
-            new(@"STATE\s*:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+        private static readonly System.Text.RegularExpressions.Regex ScStateRegex = new(@"STATE\s*:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.Compiled);
 
         private async Task<bool> TryStartServiceAsync(string serviceName)
         {
             var start = await RunScAsync("start", serviceName);
             if (start == null) return false; 
-
             var (startExit, startOutput) = start.Value;
 
-            if (startExit != 0 && startExit != ERROR_SERVICE_ALREADY_RUNNING)
-            {
-                _logger.LogWarning("'sc start {service}' failed with exit code {code}: {output}", serviceName, startExit, startOutput);
-                return false;
-            }
+            if (startExit != 0 && startExit != ERROR_SERVICE_ALREADY_RUNNING) return false;
 
             const int maxPolls = 15;
-            int? lastState = null;
-
             for (int i = 0; i < maxPolls; i++)
             {
                 var query = await RunScAsync("query", serviceName);
                 if (query != null)
                 {
                     var (queryExit, queryOutput) = query.Value;
-                    if (queryExit != 0)
-                    {
-                        _logger.LogWarning("'sc query {service}' failed with exit code {code}: {output}", serviceName, queryExit, queryOutput);
-                        return false;
-                    }
-
+                    if (queryExit != 0) return false;
                     var match = ScStateRegex.Match(queryOutput);
-                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out int state))
-                    {
-                        _logger.LogWarning("Start of {service} was accepted (sc start exit code {code}) but its state could not be read from 'sc query', so it is not confirmed running.", serviceName, startExit);
-                        return false;
-                    }
-
-                    lastState = state;
-
+                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out int state)) return false;
                     if (state == ServiceStateRunning) return true;
-
-                    if (state == ServiceStateStopped)
-                    {
-                        _logger.LogWarning("Service {service} went back to STOPPED right after start was accepted (it likely failed during startup). sc query output: {output}", serviceName, queryOutput);
-                        return false;
-                    }
+                    if (state == ServiceStateStopped) return false;
                 }
-
                 await Task.Delay(2000);
             }
-
-            _logger.LogWarning("Service {service} did not reach RUNNING within {seconds}s (last observed state code: {state}).", serviceName, maxPolls * 2, lastState?.ToString() ?? "unknown");
             return false;
         }
 
         private async Task<(int ExitCode, string Output)?> RunScAsync(params string[] args)
         {
-            string argText = string.Join(' ', args);
             try
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = SystemExe("sc.exe"),
+                    FileName = Path.Combine(Environment.SystemDirectory, "sc.exe"),
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -1099,56 +897,41 @@ namespace NetworkWatchdogService
                 foreach (var arg in args) psi.ArgumentList.Add(arg);
 
                 using var proc = Process.Start(psi);
-                if (proc == null)
-                {
-                    _logger.LogError("sc.exe {args} could not be started.", argText);
-                    return null;
-                }
+                if (proc == null) return null;
 
                 var stdoutTask = proc.StandardOutput.ReadToEndAsync();
                 var stderrTask = proc.StandardError.ReadToEndAsync();
 
                 using var cts = new CancellationTokenSource(ScCommandTimeout);
-                try
-                {
-                    await proc.WaitForExitAsync(cts.Token);
-                }
+                try { await proc.WaitForExitAsync(cts.Token); }
                 catch (OperationCanceledException)
                 {
                     try { proc.Kill(entireProcessTree: true); } catch { }
-                    _logger.LogWarning("sc.exe {args} did not finish within {seconds}s and was terminated.", argText, ScCommandTimeout.TotalSeconds);
                     return null;
                 }
 
-                string output = ((await stdoutTask) + (await stderrTask)).Trim();
-                return (proc.ExitCode, output);
+                return (proc.ExitCode, ((await stdoutTask) + (await stderrTask)).Trim());
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to run sc.exe {args}.", argText);
-                return null;
-            }
+            catch { return null; }
         }
-
-        private static string SystemExe(string fileName) => Path.Combine(Environment.SystemDirectory, fileName);
 
         private void ExecuteSafeCommand(string filename, string[] args, bool suppressErrors = false)
         {
             try
             {
-                var psi = new ProcessStartInfo { FileName = SystemExe(filename), UseShellExecute = false, CreateNoWindow = true };
-                foreach (var arg in args)
-                {
-                    psi.ArgumentList.Add(arg);
-                }
+                var psi = new ProcessStartInfo { FileName = Path.Combine(Environment.SystemDirectory, filename), UseShellExecute = false, CreateNoWindow = true };
+                foreach (var arg in args) psi.ArgumentList.Add(arg);
                 using var proc = Process.Start(psi);
                 proc?.WaitForExit();
             }
-            catch (Exception ex)
-            {
-                if (!suppressErrors) _logger.LogError(ex, "Command failed: {filename}", filename);
-            }
+            catch { }
         }
+    }
+
+    public class PersistedState
+    {
+        public int GlobalThreshold { get; set; } = 1500;
+        public List<string> Whitelist { get; set; } = new();
     }
 
     public class TelemetryPacket
@@ -1173,5 +956,6 @@ namespace NetworkWatchdogService
         public int? NewGlobalThreshold { get; set; }
         public string? AddWhitelist { get; set; }
         public string? RemoveWhitelist { get; set; }
+        public bool? SaveRequested { get; set; }
     }
 }

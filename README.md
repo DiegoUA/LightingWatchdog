@@ -89,7 +89,7 @@ While originally built to tame `LightingService.exe`, it has evolved into a syst
 | **v3.0.0** | 2026‑09‑19 | **Architectural shift:** Scaffolded C# .NET 8 Worker Service for native Windows Service integration. |
 | **v3.4.0** | 2026‑09‑24 | Added Named Pipe IPC streaming, runtime threshold slider with process whitelisting. |
 | **v3.5.0** | 2026‑09‑28 | Base production milestone introducing asynchronous ETW channels, native OS TCP synchronization. |
-| **v3.6.0** | 2026‑09‑30 | **Major Lifecycle Update:** Implemented Inno Setup installer for unified deployment, and embedded the `GitHubAutoUpdater` module in the Tray App for seamless OTA updates. |
+| **v3.6.0** | 2026-10-02 | **Major Lifecycle & Stability Update:** Inno Setup installer, OTA auto-updater, UDP socket resolution (`ERR_NO_BUFFER_SPACE` fix), UI noise filtration, and persistent threshold saving. |
 
 *(For full patch details, view `CHANGELOG.md`)*
 
