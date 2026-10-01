@@ -165,64 +165,70 @@ namespace NetworkWatchdogService
             }
         }
 
-        private Dictionary<int, int> GetNativeConnectionCounts()
+        private Dictionary<int, int>? GetNativeConnectionCounts()
         {
             var counts = new Dictionary<int, int>();
-            
-            void FetchNative(bool isUdp, int ipVersion, int pidOffset, int rowSize)
+            bool fetchFailed = false;
+
+            void FetchNative(bool isUdp, int ipVersion, int pidOffset, int rowSize, int tblClass)
             {
+                if (fetchFailed) return;
+
                 int bufferSize = 0;
-                if (isUdp) GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, 1, 0); // UDP_TABLE_OWNER_PID
-                else GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, 5, 0); // TCP_TABLE_OWNER_PID_ALL
+                uint result = isUdp 
+                    ? GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0)
+                    : GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0);
 
                 if (bufferSize == 0) return;
 
-                bufferSize += 100000; // 100KB padding to defeat TOCTOU race condition
-                IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
-                
-                try
+                for (int attempt = 0; attempt < 5; attempt++)
                 {
-                    uint result = isUdp 
-                        ? GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, 1, 0)
-                        : GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, 5, 0);
-
-                    if (result == 0)
+                    bufferSize += 100000; 
+                    IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
+                    
+                    try
                     {
-                        int rowCount = Marshal.ReadInt32(tablePtr);
-                        IntPtr rowPtr = tablePtr + 4; // Skip the row count header
-                        
-                        // Handle 64-bit struct padding explicitly
-                        if (ipVersion == AF_INET6 && !isUdp && IntPtr.Size == 8)
-                        {
-                            rowPtr = tablePtr + 8; // x64 struct padding offset
-                        }
+                        result = isUdp 
+                            ? GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0)
+                            : GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0);
 
-                        for (int i = 0; i < rowCount; i++)
+                        if (result == 0)
                         {
-                            int pid = Marshal.ReadInt32(rowPtr + pidOffset);
-                            if (pid > 4)
+                            int rowCount = Marshal.ReadInt32(tablePtr);
+                            IntPtr rowPtr = tablePtr + 4; 
+                            
+                            for (int i = 0; i < rowCount; i++)
                             {
-                                counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
+                                int pid = Marshal.ReadInt32(rowPtr + pidOffset);
+                                if (pid > 4)
+                                {
+                                    counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
+                                }
+                                rowPtr += rowSize;
                             }
-                            rowPtr += rowSize;
+                            return; 
+                        }
+                        
+                        if (result != ERROR_INSUFFICIENT_BUFFER)
+                        {
+                            return; 
                         }
                     }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(tablePtr);
+                    }
                 }
-                finally
-                {
-                    Marshal.FreeHGlobal(tablePtr);
-                }
+                
+                fetchFailed = true; 
             }
 
-            // TCP IPv4: MIB_TCPTABLE_OWNER_PID
-            FetchNative(false, AF_INET, 20, 24); 
-            // TCP IPv6: MIB_TCP6TABLE_OWNER_PID
-            FetchNative(false, AF_INET6, 52, 56);
-            // UDP IPv4: MIB_UDPTABLE_OWNER_PID
-            FetchNative(true, AF_INET, 8, 12);
-            // UDP IPv6: MIB_UDP6TABLE_OWNER_PID
-            FetchNative(true, AF_INET6, 24, 28);
+            FetchNative(false, AF_INET, 20, 24, 5); 
+            FetchNative(false, AF_INET6, 52, 56, 5);
+            FetchNative(true, AF_INET, 8, 12, 1);
+            FetchNative(true, AF_INET6, 24, 28, 1);
 
+            if (fetchFailed) return null;
             return counts;
         }
 
@@ -230,7 +236,7 @@ namespace NetworkWatchdogService
         {
             var counts = GetNativeConnectionCounts();
             
-            if (counts == null || counts.Count == 0)
+            if (counts == null)
             {
                 _logger.LogWarning("Aborting baseline resync due to native fetch failure.");
                 return;
@@ -243,18 +249,10 @@ namespace NetworkWatchdogService
                 {
                     if (!counts.ContainsKey(pid))
                     {
-                        try
-                        {
-                            using var p = Process.GetProcessById(pid);
-                            _pidConnectionCounts[pid] = 0;
-                        }
-                        catch
-                        {
-                            _pidConnectionCounts.TryRemove(pid, out _);
-                            _pidStartTimes.TryRemove(pid, out _);
-                            _processNameCache.TryRemove(pid, out _);
-                            _serviceNameCache.TryRemove(pid, out _);
-                        }
+                        _pidConnectionCounts.TryRemove(pid, out _);
+                        _pidStartTimes.TryRemove(pid, out _);
+                        _processNameCache.TryRemove(pid, out _);
+                        _serviceNameCache.TryRemove(pid, out _);
                     }
                 }
 
@@ -262,23 +260,7 @@ namespace NetworkWatchdogService
                 {
                     _pidConnectionCounts[kvp.Key] = kvp.Value;
                 }
-
-                PruneStaleCaches();
             }
-        }
-
-        private void PruneStaleCaches()
-        {
-            var live = new HashSet<int>(_pidConnectionCounts.Keys);
-
-            foreach (var pid in _pidStartTimes.Keys.ToList())
-                if (!live.Contains(pid)) _pidStartTimes.TryRemove(pid, out _);
-
-            foreach (var pid in _processNameCache.Keys.ToList())
-                if (!live.Contains(pid)) _processNameCache.TryRemove(pid, out _);
-
-            foreach (var pid in _serviceNameCache.Keys.ToList())
-                if (!live.Contains(pid)) _serviceNameCache.TryRemove(pid, out _);
         }
 
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
