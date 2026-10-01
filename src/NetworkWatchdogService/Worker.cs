@@ -165,99 +165,138 @@ namespace NetworkWatchdogService
             }
         }
 
-        private Dictionary<int, int>? GetNativeConnectionCounts()
+        /// <summary>
+        /// Returns per-PID TCP+UDP row counts, plus whether every one of the
+        /// four families (TCP/v4, TCP/v6, UDP/v4, UDP/v6) was actually read.
+        /// `Complete` matters: the caller should only treat a PID's absence
+        /// from `Counts` as "it has zero connections" when every family was
+        /// read successfully. If TCP/v4 failed, a PID could easily have
+        /// thousands of TCP rows we simply didn't see this cycle.
+        /// </summary>
+        private (Dictionary<int, int> Counts, bool Complete) GetNativeConnectionCounts()
         {
             var counts = new Dictionary<int, int>();
-            bool fetchFailed = false;
+            bool allComplete = true;
 
-            void FetchNative(bool isUdp, int ipVersion, int pidOffset, int rowSize, int tblClass)
+            bool FetchNative(bool isUdp, int ipVersion, int pidOffset, int rowSize, int tblClass, string label)
             {
-                if (fetchFailed) return;
-
                 int bufferSize = 0;
-                uint result = isUdp 
+                uint probeResult = isUdp
                     ? GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0)
                     : GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, tblClass, 0);
 
-                if (bufferSize == 0) return;
+                if (bufferSize == 0) return true; // nothing to report for this family right now
 
-                for (int attempt = 0; attempt < 5; attempt++)
+                const int MaxAttempts = 8;
+                for (int attempt = 0; attempt < MaxAttempts; attempt++)
                 {
-                    bufferSize += 100000; 
-                    IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
-                    
+                    // Pad generously above whatever the OS most recently told us it
+                    // needs, rather than adding a fixed +100000 every retry. Under
+                    // heavy connection churn the table can grow between the probe
+                    // and the fetch (or between retries) faster than a flat
+                    // increment can keep up with, which is what was happening here:
+                    // TCP/v4 kept losing the race, failing out after 5 attempts,
+                    // and voiding the entire resync (see below).
+                    int attemptSize = bufferSize + bufferSize / 4 + 4096;
+                    IntPtr tablePtr = Marshal.AllocHGlobal(attemptSize);
                     try
                     {
-                        result = isUdp 
-                            ? GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0)
-                            : GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, tblClass, 0);
+                        int reportedSize = attemptSize;
+                        uint result = isUdp
+                            ? GetExtendedUdpTable(tablePtr, ref reportedSize, false, ipVersion, tblClass, 0)
+                            : GetExtendedTcpTable(tablePtr, ref reportedSize, false, ipVersion, tblClass, 0);
 
                         if (result == 0)
                         {
                             int rowCount = Marshal.ReadInt32(tablePtr);
-                            IntPtr rowPtr = tablePtr + 4; 
-                            
+                            IntPtr rowPtr = tablePtr + 4; // Skip dwNumEntries
                             for (int i = 0; i < rowCount; i++)
                             {
                                 int pid = Marshal.ReadInt32(rowPtr + pidOffset);
-                                if (pid > 4)
-                                {
-                                    counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
-                                }
+                                if (pid > 4) counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
                                 rowPtr += rowSize;
                             }
-                            return; 
+                            return true;
                         }
-                        
+
                         if (result != ERROR_INSUFFICIENT_BUFFER)
                         {
-                            return; 
+                            _logger.LogWarning("GetExtended{kind}Table ({label}) failed with Win32 error {err}.", isUdp ? "Udp" : "Tcp", label, result);
+                            return false;
                         }
+
+                        // The OS just wrote back the size it actually needs right
+                        // now - trust that over our own padded guess for the next attempt.
+                        bufferSize = reportedSize;
                     }
                     finally
                     {
                         Marshal.FreeHGlobal(tablePtr);
                     }
                 }
-                
-                fetchFailed = true; 
+
+                _logger.LogWarning("GetExtended{kind}Table ({label}) kept returning ERROR_INSUFFICIENT_BUFFER after {attempts} attempts - the table is growing faster than we can read it. Skipping this family for this cycle; existing counts for PIDs only seen via this family will not be corrected.", isUdp ? "Udp" : "Tcp", label, MaxAttempts);
+                return false;
             }
 
-            FetchNative(false, AF_INET, 20, 24, 5); 
-            FetchNative(false, AF_INET6, 52, 56, 5);
-            FetchNative(true, AF_INET, 8, 12, 1);
-            FetchNative(true, AF_INET6, 24, 28, 1);
+            // Note the `&=` (not `&&=`): every family is always attempted, even if
+            // an earlier one failed, instead of the old behavior where one failed
+            // family skipped the rest and voided the whole resync.
+            allComplete &= FetchNative(false, AF_INET, 20, 24, 5, "TCP/v4");
+            allComplete &= FetchNative(false, AF_INET6, 52, 56, 5, "TCP/v6");
+            allComplete &= FetchNative(true, AF_INET, 8, 12, 1, "UDP/v4");
+            allComplete &= FetchNative(true, AF_INET6, 24, 28, 1, "UDP/v6");
 
-            if (fetchFailed) return null;
-            return counts;
+            return (counts, allComplete);
         }
 
         private void ResyncGlobalBaseline()
         {
-            var counts = GetNativeConnectionCounts();
-            
-            if (counts == null)
+            var (counts, complete) = GetNativeConnectionCounts();
+
+            if (counts.Count == 0 && !complete)
             {
-                _logger.LogWarning("Aborting baseline resync due to native fetch failure.");
+                // Every family failed outright (not just one) - nothing to merge.
+                _logger.LogWarning("Aborting baseline resync: no connection family could be read this cycle.");
                 return;
+            }
+
+            if (!complete)
+            {
+                _logger.LogWarning("Baseline resync is partial this cycle (some connection family failed to read); " +
+                    "merging the {count} PIDs we did get counts for, but NOT pruning PIDs absent from this snapshot " +
+                    "(their absence may just mean the failed family, not zero connections).", counts.Count);
             }
 
             lock (_connectionCountsLock)
             {
-                var trackedPids = _pidConnectionCounts.Keys.ToList();
-                foreach (var pid in trackedPids)
+                if (complete)
                 {
-                    if (!counts.ContainsKey(pid))
+                    var trackedPids = _pidConnectionCounts.Keys.ToList();
+                    foreach (var pid in trackedPids)
                     {
-                        _pidConnectionCounts.TryRemove(pid, out _);
-                        _pidStartTimes.TryRemove(pid, out _);
-                        _processNameCache.TryRemove(pid, out _);
-                        _serviceNameCache.TryRemove(pid, out _);
+                        if (!counts.ContainsKey(pid))
+                        {
+                            _pidConnectionCounts.TryRemove(pid, out _);
+                            _pidStartTimes.TryRemove(pid, out _);
+                            _processNameCache.TryRemove(pid, out _);
+                            _serviceNameCache.TryRemove(pid, out _);
+                        }
                     }
                 }
 
                 foreach (var kvp in counts)
                 {
+                    // Surfaces proof, next time this happens, of which theory is
+                    // right: if this logs a number in the thousands matching
+                    // Get-NetTCPConnection, the fetch is succeeding and the gap is
+                    // real TIME_WAIT rows vs. live AFD handles - a semantics
+                    // question, not a bug. If it never logs big numbers for a PID
+                    // you know is leaking, the fetch is still failing for that PID.
+                    if (kvp.Value >= 500)
+                    {
+                        _logger.LogInformation("Baseline resync: PID {pid} has {count} native TCP/UDP table rows.", kvp.Key, kvp.Value);
+                    }
                     _pidConnectionCounts[kvp.Key] = kvp.Value;
                 }
             }
