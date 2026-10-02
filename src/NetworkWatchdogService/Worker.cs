@@ -24,60 +24,9 @@ namespace NetworkWatchdogService
         [DllImport("iphlpapi.dll", SetLastError = true)]
         private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
 
-        [DllImport("iphlpapi.dll", SetLastError = true)]
-        private static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
-
         private const int AF_INET = 2;
         private const int AF_INET6 = 23;
         private const int TCP_TABLE_OWNER_PID_ALL = 5;
-        private const int UDP_TABLE_OWNER_PID = 1;
-        private const uint ERROR_INSUFFICIENT_BUFFER = 122;
-
-        // Struct definitions for safe P/Invoke marshalling (Eliminates manual pointer math bugs)
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_TCPROW_OWNER_PID
-        {
-            public uint state;
-            public uint localAddr;
-            public uint localPort;
-            public uint remoteAddr;
-            public uint remotePort;
-            public int owningPid;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_TCP6ROW_OWNER_PID
-       
-        {
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-            public byte[] localAddr;
-            public uint localScopeId;
-            public uint localPort;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-            public byte[] remoteAddr;
-            public uint remoteScopeId;
-            public uint remotePort;
-            public uint state;
-            public int owningPid;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_UDPROW_OWNER_PID
-        {
-            public uint localAddr;
-            public uint localPort;
-            public int owningPid;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_UDP6ROW_OWNER_PID
-        {
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-            public byte[] localAddr;
-            public uint localScopeId;
-            public uint localPort;
-            public int owningPid;
-        }
 
         private readonly ILogger<Worker> _logger;
         private TraceEventSession? _etwSession;
@@ -104,6 +53,13 @@ namespace NetworkWatchdogService
 
         private readonly record struct AfdEvent(int ProcessId, bool IsConnect);
 
+        // Bumped every time this file changes, logged loudly at startup and
+        // exposed in telemetry, so you can tell at a glance - from the
+        // service's own log or the dashboard itself - whether the process
+        // that's actually running matches the source you just built. Given
+        // that none of the last several fixes changed the observed behavior
+        // at all, confirming this before chasing another code theory will
+        // save us both time if the real issue turns out to be a stale build.
         private const string BuildMarker = "2026-10-02-diag1";
 
         public Worker(ILogger<Worker> logger)
@@ -163,7 +119,11 @@ namespace NetworkWatchdogService
                                 if (_whitelist.ContainsKey(cleanName) || _whitelist.ContainsKey(procName)) 
                                     continue;
 
-                                _logger.LogWarning("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid}!", currentConnections, _globalMaxTcpConnections, proc.Id);
+                                // Temporarily LogCritical, not LogWarning: your Event Log provider is
+                                // filtering out Warning/Information entirely (confirmed - only Critical
+                                // came through), so this and the other lines below are bumped purely so
+                                // we can actually see them while we diagnose. Revert once we're done.
+                                _logger.LogCritical("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid}!", currentConnections, _globalMaxTcpConnections, proc.Id);
                                 
                                 _activeRestarts.TryAdd(pid, DateTime.UtcNow);
                                 
@@ -190,23 +150,16 @@ namespace NetworkWatchdogService
             {
                 await foreach (var evt in _etwChannel.Reader.ReadAllAsync(token))
                 {
-                    try
+                    lock (_connectionCountsLock)
                     {
-                        lock (_connectionCountsLock)
+                        if (evt.IsConnect)
                         {
-                            if (evt.IsConnect)
-                            {
-                                _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 1, (_, count) => count + 1);
-                            }
-                            else
-                            {
-                                _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 0, (_, count) => Math.Max(0, count - 1));
-                            }
+                            _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 1, (_, count) => count + 1);
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to apply ETW connection-count update for PID {pid}.", evt.ProcessId);
+                        else
+                        {
+                            _pidConnectionCounts.AddOrUpdate(evt.ProcessId, 0, (_, count) => Math.Max(0, count - 1));
+                        }
                     }
                 }
             }
@@ -222,6 +175,17 @@ namespace NetworkWatchdogService
             }
         }
 
+        /// <summary>
+        /// ResyncGlobalBaseline already guards the native fetch itself, but
+        /// NOT the dictionary merge/prune section that follows it, and
+        /// PeriodicResyncLoopAsync's call site had no guard at all. Since this
+        /// loop runs as an unobserved fire-and-forget Task, a single unhandled
+        /// exception anywhere in ResyncGlobalBaseline - fetch or merge - kills
+        /// resync silently and permanently for the life of the process, with
+        /// zero crash and zero log, leaving _pidConnectionCounts to drift on
+        /// ETW deltas alone indefinitely. This wrapper closes that gap and
+        /// guarantees we at least see it happen if it does.
+        /// </summary>
         private void SafeResyncGlobalBaseline(string trigger)
         {
             try
@@ -230,133 +194,127 @@ namespace NetworkWatchdogService
             }
             catch (Exception ex)
             {
-                _logger.LogCritical(ex, "ResyncGlobalBaseline threw and was about to silently kill resync (trigger: {trigger}, BuildMarker: {marker}).", trigger, BuildMarker);
+                _logger.LogCritical(ex, "ResyncGlobalBaseline threw and was about to silently kill baseline resync for the rest of the process's life (trigger: {trigger}, BuildMarker: {marker}).", trigger, BuildMarker);
             }
         }
 
-        private Dictionary<int, int> GetNativeConnectionCounts()
+        private Dictionary<int, int> GetNativeTcpConnectionCounts()
         {
             var counts = new Dictionary<int, int>();
 
-            void FetchTcp(int ipVersion, Type rowType)
+            const uint ERROR_INSUFFICIENT_BUFFER = 122;
+            const int MaxAttempts = 5;
+
+            void Fetch(int ipVersion, int rowSize, int pidOffset)
             {
                 int bufferSize = 0;
                 GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
                 if (bufferSize == 0) return;
 
-                for (int attempt = 0; attempt < 5; attempt++)
+                for (int attempt = 0; attempt < MaxAttempts; attempt++)
                 {
-                    bufferSize += 65536; // Dynamic padding headroom
-                    IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
+                    IntPtr tcpTablePtr = Marshal.AllocHGlobal(bufferSize);
                     try
                     {
-                        uint result = GetExtendedTcpTable(tablePtr, ref bufferSize, false, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+                        uint result = GetExtendedTcpTable(tcpTablePtr, ref bufferSize, false, ipVersion, TCP_TABLE_OWNER_PID_ALL, 0);
+
                         if (result == 0)
                         {
-                            int rowCount = Marshal.ReadInt32(tablePtr);
-                            IntPtr rowPtr = tablePtr + 4;
-                            int rowSize = Marshal.SizeOf(rowType);
+                            int rowCount = Marshal.ReadInt32(tcpTablePtr);
+                            IntPtr rowPtr = tcpTablePtr + 4; 
 
                             for (int i = 0; i < rowCount; i++)
                             {
-                                int pid = 0;
-                                if (ipVersion == AF_INET)
-                                {
-                                    var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
-                                    pid = row.owningPid;
-                                }
-                                else
-                                {
-                                    var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr);
-                                    pid = (int)row.owningPid;
-                                }
-
-                                if (pid > 4)
-                                {
-                                    counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
-                                }
+                                int pid = Marshal.ReadInt32(rowPtr + pidOffset);
+                                counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
                                 rowPtr += rowSize;
                             }
                             return;
                         }
-                        if (result != ERROR_INSUFFICIENT_BUFFER) return;
-                    }
-                    finally
-                    {
-                        Marshal.FreeHGlobal(tablePtr);
-                    }
-                }
-            }
 
-            void FetchUdp(int ipVersion, Type rowType)
-            {
-                int bufferSize = 0;
-                GetExtendedUdpTable(IntPtr.Zero, ref bufferSize, false, ipVersion, UDP_TABLE_OWNER_PID, 0);
-                if (bufferSize == 0) return;
-
-                for (int attempt = 0; attempt < 5; attempt++)
-                {
-                    bufferSize += 32768;
-                    IntPtr tablePtr = Marshal.AllocHGlobal(bufferSize);
-                    try
-                    {
-                        uint result = GetExtendedUdpTable(tablePtr, ref bufferSize, false, ipVersion, UDP_TABLE_OWNER_PID, 0);
-                        if (result == 0)
+                        if (result != ERROR_INSUFFICIENT_BUFFER)
                         {
-                            int rowCount = Marshal.ReadInt32(tablePtr);
-                            IntPtr rowPtr = tablePtr + 4;
-                            int rowSize = Marshal.SizeOf(rowType);
-
-                            for (int i = 0; i < rowCount; i++)
-                            {
-                                int pid = 0;
-                                if (ipVersion == AF_INET)
-                                {
-                                    var row = Marshal.PtrToStructure<MIB_UDPROW_OWNER_PID>(rowPtr);
-                                    pid = row.owningPid;
-                                }
-                                else
-                                {
-                                    var row = Marshal.PtrToStructure<MIB_UDP6ROW_OWNER_PID>(rowPtr);
-                                    pid = (int)row.owningPid;
-                                }
-
-                                if (pid > 4)
-                                {
-                                    counts[pid] = counts.TryGetValue(pid, out int c) ? c + 1 : 1;
-                                }
-                                rowPtr += rowSize;
-                            }
                             return;
                         }
-                        if (result != ERROR_INSUFFICIENT_BUFFER) return;
                     }
                     finally
                     {
-                        Marshal.FreeHGlobal(tablePtr);
+                        Marshal.FreeHGlobal(tcpTablePtr);
                     }
                 }
+
+                _logger.LogCritical("GetExtendedTcpTable (IPv{ver}) kept returning ERROR_INSUFFICIENT_BUFFER after {attempts} attempts; skipping this cycle.", ipVersion == AF_INET ? 4 : 6, MaxAttempts);
             }
 
-            try
-            {
-                FetchTcp(AF_INET, typeof(MIB_TCPROW_OWNER_PID));
-                FetchTcp(AF_INET6, typeof(MIB_TCP6ROW_OWNER_PID));
-                FetchUdp(AF_INET, typeof(MIB_UDPROW_OWNER_PID));
-                FetchUdp(AF_INET6, typeof(MIB_UDP6ROW_OWNER_PID));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Critical failure during safe P/Invoke table population.");
-            }
+            Fetch(AF_INET, 24, 20);
+            Fetch(AF_INET6, 56, 52);
 
             return counts;
         }
 
+        /// <summary>
+        /// Diagnostic only: logs the native table row count for whichever PID(s)
+        /// currently belong to a process with this name. Resolved by name every
+        /// call rather than cached, since the whole point is surviving restarts
+        /// (and therefore PID changes) without needing a code edit/redeploy. If
+        /// the process restarts mid-leak you may briefly see it logged under two
+        /// PIDs (the dying one and its replacement) in the same cycle - that's
+        /// expected, not a bug.
+        /// </summary>
+        private void LogNativeCountForWatchedProcess(Dictionary<int, int> counts, string processName)
+        {
+            Process[] matches;
+            try
+            {
+                matches = Process.GetProcessesByName(processName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Failed to resolve PID(s) for watched process name {name}.", processName);
+                return;
+            }
+
+            try
+            {
+                if (matches.Length == 0)
+                {
+                    _logger.LogCritical("Baseline resync: no running process named {name} found.", processName);
+                    return;
+                }
+
+                foreach (var proc in matches)
+                {
+                    int pid = proc.Id;
+                    _logger.LogCritical("Baseline resync: {name} (PID {pid}) = {val} native TCP table rows.",
+                        processName, pid, counts.TryGetValue(pid, out int val) ? val.ToString() : "not present in native table");
+                }
+            }
+            finally
+            {
+                foreach (var proc in matches) proc.Dispose();
+            }
+        }
+
         private void ResyncGlobalBaseline()
         {
-            _logger.LogInformation("Resyncing socket baselines via safe P/Invoke structured tables...");
-            var counts = GetNativeConnectionCounts();
+            _logger.LogCritical("Resyncing socket baselines via IP Helper API...");
+            var counts = new Dictionary<int, int>();
+            try
+            {
+                counts = GetNativeTcpConnectionCounts();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Failed to execute native TCP table baseline fetch.");
+                return;
+            }
+
+            // Unconditional, every cycle, regardless of threshold: proves the
+            // fetch ran and shows exactly what it saw for the watched process,
+            // present or not. Looked up by name, not a hardcoded PID - PIDs are
+            // reassigned every time the process restarts, so a literal number
+            // here would need editing (and redeploying) after every restart.
+            LogNativeCountForWatchedProcess(counts, "LightingService");
 
             lock (_connectionCountsLock)
             {
@@ -384,9 +342,19 @@ namespace NetworkWatchdogService
                 {
                     if (kvp.Value >= 50)
                     {
-                        _logger.LogInformation("Baseline resync: PID {pid} has {count} native TCP/UDP table rows. BuildMarker={marker}", kvp.Key, kvp.Value, BuildMarker);
+                        // Proof, not a guess: if this logs a number close to what
+                        // Get-NetTCPConnection shows for the same PID, resync is
+                        // reading reality correctly and the dashboard's gap is a
+                        // semantics issue (live AFD handles vs. all table rows,
+                        // including TIME_WAIT), not a fetch bug. If this NEVER
+                        // logs for a PID you know is leaking, resync still isn't
+                        // reaching that PID's true count.
+                        _logger.LogCritical("Baseline resync: PID {pid} has {count} native TCP table rows. BuildMarker={marker}", kvp.Key, kvp.Value, BuildMarker);
                     }
-                    _pidConnectionCounts[kvp.Key] = kvp.Value;
+                    if (kvp.Key > 4)
+                    {
+                        _pidConnectionCounts[kvp.Key] = kvp.Value;
+                    }
                 }
 
                 PruneStaleCaches();
@@ -717,11 +685,15 @@ namespace NetworkWatchdogService
                     !IsAdminOnlyLocation(dir, isDirectory: true) ||
                     !IsAdminOnlyLocation(_whitelistFilePath, isDirectory: false))
                 {
-                    _logger.LogCritical("Refusing to load whitelist from {path}: file or directory is not exclusively owned/writable by Administrators or SYSTEM.", _whitelistFilePath);
+                    _logger.LogCritical("Refusing to load whitelist from {path}: file or directory is not exclusively owned/writable by Administrators or SYSTEM. Starting with an empty dynamic whitelist.", _whitelistFilePath);
                     return;
                 }
 
-                if (new FileInfo(_whitelistFilePath).Length > MaxWhitelistFileBytes) return;
+                if (new FileInfo(_whitelistFilePath).Length > MaxWhitelistFileBytes)
+                {
+                    _logger.LogError("Refusing to load whitelist from {path}: file exceeds {max} bytes.", _whitelistFilePath, MaxWhitelistFileBytes);
+                    return;
+                }
 
                 List<string?>? rawEntries;
                 try
@@ -730,25 +702,36 @@ namespace NetworkWatchdogService
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogError(ex, "Whitelist file {path} is not valid JSON.", _whitelistFilePath);
+                    _logger.LogError(ex, "Whitelist file {path} is not a valid JSON array of strings; starting with an empty dynamic whitelist.", _whitelistFilePath);
                     return;
                 }
 
                 if (rawEntries == null) return;
 
                 var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int invalid = 0, duplicates = 0;
+
                 foreach (var raw in rawEntries)
                 {
-                    if (unique.Count >= MaxWhitelistEntries) break;
-                    if (TryNormalizeWhitelistEntry(raw, out string entry)) unique.Add(entry);
+                    if (unique.Count >= MaxWhitelistEntries)
+                    {
+                        _logger.LogWarning("Whitelist file has more than {max} entries; ignoring the rest.", MaxWhitelistEntries);
+                        break;
+                    }
+
+                    if (!TryNormalizeWhitelistEntry(raw, out string entry)) { invalid++; continue; }
+                    if (!unique.Add(entry)) { duplicates++; }
                 }
 
                 foreach (var entry in unique)
                     _whitelist.TryAdd(entry, 1);
+
+                _logger.LogInformation("Loaded {count} whitelist entries from {path} ({dupes} duplicates and {invalid} invalid entries skipped).",
+                    unique.Count, _whitelistFilePath, duplicates, invalid);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to load persisted whitelist.");
+                _logger.LogError(ex, "Failed to load persisted whitelist from {path}; starting with an empty dynamic whitelist.", _whitelistFilePath);
             }
         }
 
@@ -757,30 +740,66 @@ namespace NetworkWatchdogService
         {
             try
             {
-                var admins = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
-                var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+                var admins = new System.Security.Principal.SecurityIdentifier(
+                    System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+                var system = new System.Security.Principal.SecurityIdentifier(
+                    System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
 
-                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                {
+                    _logger.LogWarning("{path} is a reparse point; treating as untrusted.", path);
+                    return false;
+                }
 
                 System.Security.AccessControl.FileSystemSecurity security = isDirectory
                     ? new DirectoryInfo(path).GetAccessControl()
                     : new FileInfo(path).GetAccessControl();
 
-                var owner = security.GetOwner(typeof(System.Security.Principal.SecurityIdentifier)) as System.Security.Principal.SecurityIdentifier;
-                if (owner == null || !(owner.Equals(admins) || owner.Equals(system))) return false;
+                var owner = security.GetOwner(typeof(System.Security.Principal.SecurityIdentifier))
+                    as System.Security.Principal.SecurityIdentifier;
+                if (owner == null || !(owner.Equals(admins) || owner.Equals(system)))
+                {
+                    _logger.LogWarning("{path} is owned by {owner}, not Administrators/SYSTEM.", path, owner?.Value ?? "unknown");
+                    return false;
+                }
 
-                const System.Security.AccessControl.FileSystemRights writeish = (System.Security.AccessControl.FileSystemRights)0x40000000 | (System.Security.AccessControl.FileSystemRights)0x10000000 | System.Security.AccessControl.FileSystemRights.WriteData | System.Security.AccessControl.FileSystemRights.AppendData | System.Security.AccessControl.FileSystemRights.WriteAttributes | System.Security.AccessControl.FileSystemRights.Delete;
+                const System.Security.AccessControl.FileSystemRights genericWrite = (System.Security.AccessControl.FileSystemRights)0x40000000;
+                const System.Security.AccessControl.FileSystemRights genericAll = (System.Security.AccessControl.FileSystemRights)0x10000000;
 
-                foreach (System.Security.AccessControl.FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+                const System.Security.AccessControl.FileSystemRights writeish =
+                    genericWrite |
+                    genericAll |
+                    System.Security.AccessControl.FileSystemRights.WriteData |
+                    System.Security.AccessControl.FileSystemRights.AppendData |
+                    System.Security.AccessControl.FileSystemRights.WriteExtendedAttributes |
+                    System.Security.AccessControl.FileSystemRights.WriteAttributes |
+                    System.Security.AccessControl.FileSystemRights.Delete |
+                    System.Security.AccessControl.FileSystemRights.DeleteSubdirectoriesAndFiles |
+                    System.Security.AccessControl.FileSystemRights.ChangePermissions |
+                    System.Security.AccessControl.FileSystemRights.TakeOwnership;
+
+                foreach (System.Security.AccessControl.FileSystemAccessRule rule in
+                    security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
                 {
                     if (rule.AccessControlType != System.Security.AccessControl.AccessControlType.Allow) continue;
+
                     var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
                     if (sid.Equals(admins) || sid.Equals(system)) continue;
-                    if ((rule.FileSystemRights & writeish) != 0) return false;
+
+                    if ((rule.FileSystemRights & writeish) != 0)
+                    {
+                        _logger.LogWarning("{path} grants write-capable access to {sid}.", path, sid.Value);
+                        return false;
+                    }
                 }
+
                 return true;
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not verify ownership/ACL of {path}; treating as untrusted.", path);
+                return false;
+            }
         }
 
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
@@ -793,15 +812,29 @@ namespace NetworkWatchdogService
                 if (!string.IsNullOrEmpty(dir))
                 {
                     Directory.CreateDirectory(dir);
-                    try { SecureDirectoryToAdminsAndSystem(dir); } catch { }
-                    if (!IsAdminOnlyLocation(dir, isDirectory: true)) return;
+
+                    try
+                    {
+                        SecureDirectoryToAdminsAndSystem(dir);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir);
+                    }
+
+                    if (!IsAdminOnlyLocation(dir, isDirectory: true))
+                    {
+                        _logger.LogCritical("Not persisting whitelist: {dir} is not exclusively controlled by Administrators/SYSTEM.", dir);
+                        return;
+                    }
                 }
 
                 string tempPath = _whitelistFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(_whitelist.Keys.ToList()));
                 try
                 {
-                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        bufferSize: 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
                     {
                         await fs.WriteAsync(payload);
                         await fs.FlushAsync();
@@ -814,9 +847,10 @@ namespace NetworkWatchdogService
                     throw;
                 }
             }
+            // Ensure proper disposal and error handling on file cleanup:
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to persist whitelist.");
+                _logger.LogError(ex, "Failed to persist whitelist to disk.");
             }
             finally
             {
@@ -828,49 +862,52 @@ namespace NetworkWatchdogService
         private static void SecureDirectoryToAdminsAndSystem(string dir)
         {
             var security = new System.Security.AccessControl.DirectorySecurity();
+
             security.SetAccessRuleProtection(true, false);
-            var admins = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
-            var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+
+            var admins = new System.Security.Principal.SecurityIdentifier(
+                System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null);
+            var system = new System.Security.Principal.SecurityIdentifier(
+                System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
 
             foreach (var sid in new[] { admins, system })
             {
-                security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+                security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
+                    sid,
+                    System.Security.AccessControl.FileSystemRights.FullControl,
+                    System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+                    System.Security.AccessControl.PropagationFlags.None,
+                    System.Security.AccessControl.AccessControlType.Allow));
             }
+
             new DirectoryInfo(dir).SetAccessControl(security);
         }
 
         private void StartEtwSession(CancellationToken stoppingToken)
         {
-            try
+            if (!(TraceEventSession.IsElevated() ?? false))
             {
-                if (!(TraceEventSession.IsElevated() ?? false))
-                {
-                    _logger.LogCritical("ETW Tracing requires Administrator privileges.");
-                    return;
-                }
-
-                if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
-                {
-                    using var oldSession = new TraceEventSession("LightingWatchdogSession");
-                    oldSession.Stop();
-                }
-
-                using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
-                {
-                    using var reg = stoppingToken.Register(() => 
-                    {
-                        _etwSession?.Stop();
-                        _etwSession?.Dispose();
-                    });
-
-                    _etwSession.Source.Dynamic.All += HandleAfdEvent;
-                    _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
-                    _etwSession.Source.Process();
-                }
+                _logger.LogCritical("ETW Tracing requires Administrator privileges.");
+                return;
             }
-            catch (Exception ex)
+
+            if (TraceEventSession.GetActiveSessionNames().Contains("LightingWatchdogSession"))
             {
-                _logger.LogCritical(ex, "ETW session processing stopped unexpectedly.");
+                using var oldSession = new TraceEventSession("LightingWatchdogSession");
+                oldSession.Stop();
+            }
+
+            using (_etwSession = new TraceEventSession("LightingWatchdogSession"))
+            {
+                using var reg = stoppingToken.Register(() => 
+                {
+                    _etwSession?.Stop();
+                    _etwSession?.Dispose();
+                });
+
+                _etwSession.Source.Dynamic.All += HandleAfdEvent;
+                _etwSession.EnableProvider("Microsoft-Windows-Winsock-AFD");
+                _etwSession.Source.Process();
             }
         }
 
@@ -878,7 +915,7 @@ namespace NetworkWatchdogService
         {
             if (data.ProcessID <= 4) return;
 
-            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept") || data.EventName.Contains("AfdBind"))
+            if (data.EventName.Contains("AfdConnect") || data.EventName.Contains("AfdAccept"))
             {
                 _etwChannel.Writer.TryWrite(new AfdEvent(data.ProcessID, true));
             }
@@ -922,8 +959,72 @@ namespace NetworkWatchdogService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to refresh PID->service name cache.");
+                    _logger.LogError(ex, "Failed to refresh PID->service name cache via WMI.");
                 }
+            }
+        }
+
+        private bool IsTrustedExecutablePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(path);
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (!File.Exists(fullPath)) return false;
+
+            var roots = new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows)
+            };
+
+            bool underTrustedRoot = roots.Any(root =>
+            {
+                if (string.IsNullOrEmpty(root)) return false;
+                string normalizedRoot = Path.GetFullPath(root)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return fullPath.StartsWith(
+                        normalizedRoot + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(fullPath, normalizedRoot, StringComparison.OrdinalIgnoreCase);
+            });
+
+            if (!underTrustedRoot) return false;
+
+            return IsAuthenticodeSigned(fullPath);
+        }
+
+        private bool IsAuthenticodeSigned(string fullPath)
+        {
+            try
+            {
+#if NET9_0_OR_GREATER
+                using var signer = System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificateFromFile(fullPath);
+#else
+                using var signer = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromSignedFile(fullPath);
+#endif
+                using var chain = new System.Security.Cryptography.X509Certificates.X509Chain
+                {
+                    ChainPolicy =
+                    {
+                        RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.Online,
+                        VerificationFlags = System.Security.Cryptography.X509Certificates.X509VerificationFlags.NoFlag
+                    }
+                };
+                return chain.Build(new System.Security.Cryptography.X509Certificates.X509Certificate2(signer));
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -931,7 +1032,11 @@ namespace NetworkWatchdogService
         {
             try
             {
-                if (!TryVerifySamePid(processId, expectedStartTime, out Process? proc)) return;
+                if (!TryVerifySamePid(processId, expectedStartTime, out Process? proc))
+                {
+                    _logger.LogInformation("PID {pid} no longer matches the process that triggered the restart; skipping.", processId);
+                    return;
+                }
 
                 string? actualServiceName = GetServiceNameFromPidCached(processId);
                 string? scmServiceName = IsValidServiceName(actualServiceName) ? actualServiceName : null;
@@ -946,6 +1051,7 @@ namespace NetworkWatchdogService
 
                 if (!TryVerifySamePid(processId, expectedStartTime, out _))
                 {
+                    _logger.LogInformation("PID {pid} was recycled before taskkill could run; aborting to avoid killing an unrelated process.", processId);
                     proc?.Dispose();
                     return;
                 }
@@ -962,9 +1068,18 @@ namespace NetworkWatchdogService
 
                 await Task.Delay(30000);
 
-                if (scmServiceName != null)
+                if (scmServiceName == null)
                 {
-                    await TryStartServiceAsync(scmServiceName);
+                    _logger.LogInformation("PID {pid} ({name}) is not a registered Windows service; it was terminated and will not be relaunched.", processId, serviceNameToUse);
+                }
+                else if (await TryStartServiceAsync(scmServiceName))
+                {
+                    _logger.LogInformation("Service {serviceName} is running again after the restart.", scmServiceName);
+                }
+                else
+                {
+                    _logger.LogWarning("Service {serviceName} was not confirmed running after the restart attempt. " +
+                        "Standalone executable relaunch is disabled by design; manual intervention may be required.", scmServiceName);
                 }
             }
             finally
@@ -1020,23 +1135,49 @@ namespace NetworkWatchdogService
 
             var (startExit, startOutput) = start.Value;
 
-            if (startExit != 0 && startExit != ERROR_SERVICE_ALREADY_RUNNING) return false;
+            if (startExit != 0 && startExit != ERROR_SERVICE_ALREADY_RUNNING)
+            {
+                _logger.LogWarning("'sc start {service}' failed with exit code {code}: {output}", serviceName, startExit, startOutput);
+                return false;
+            }
 
             const int maxPolls = 15;
+            int? lastState = null;
+
             for (int i = 0; i < maxPolls; i++)
             {
                 var query = await RunScAsync("query", serviceName);
                 if (query != null)
                 {
                     var (queryExit, queryOutput) = query.Value;
-                    if (queryExit != 0) return false;
+                    if (queryExit != 0)
+                    {
+                        _logger.LogWarning("'sc query {service}' failed with exit code {code}: {output}", serviceName, queryExit, queryOutput);
+                        return false;
+                    }
+
                     var match = ScStateRegex.Match(queryOutput);
-                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out int state)) return false;
+                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out int state))
+                    {
+                        _logger.LogWarning("Start of {service} was accepted (sc start exit code {code}) but its state could not be read from 'sc query', so it is not confirmed running.", serviceName, startExit);
+                        return false;
+                    }
+
+                    lastState = state;
+
                     if (state == ServiceStateRunning) return true;
-                    if (state == ServiceStateStopped) return false;
+
+                    if (state == ServiceStateStopped)
+                    {
+                        _logger.LogWarning("Service {service} went back to STOPPED right after start was accepted (it likely failed during startup). sc query output: {output}", serviceName, queryOutput);
+                        return false;
+                    }
                 }
+
                 await Task.Delay(2000);
             }
+
+            _logger.LogWarning("Service {service} did not reach RUNNING within {seconds}s (last observed state code: {state}).", serviceName, maxPolls * 2, lastState?.ToString() ?? "unknown");
             return false;
         }
 
@@ -1047,7 +1188,7 @@ namespace NetworkWatchdogService
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = Path.Combine(Environment.SystemDirectory, "sc.exe"),
+                    FileName = SystemExe("sc.exe"),
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -1056,7 +1197,11 @@ namespace NetworkWatchdogService
                 foreach (var arg in args) psi.ArgumentList.Add(arg);
 
                 using var proc = Process.Start(psi);
-                if (proc == null) return null;
+                if (proc == null)
+                {
+                    _logger.LogError("sc.exe {args} could not be started.", argText);
+                    return null;
+                }
 
                 var stdoutTask = proc.StandardOutput.ReadToEndAsync();
                 var stderrTask = proc.StandardError.ReadToEndAsync();
@@ -1069,20 +1214,31 @@ namespace NetworkWatchdogService
                 catch (OperationCanceledException)
                 {
                     try { proc.Kill(entireProcessTree: true); } catch { }
+                    _logger.LogWarning("sc.exe {args} did not finish within {seconds}s and was terminated.", argText, ScCommandTimeout.TotalSeconds);
                     return null;
                 }
 
-                return (proc.ExitCode, ((await stdoutTask) + (await stderrTask)).Trim());
+                string output = ((await stdoutTask) + (await stderrTask)).Trim();
+                return (proc.ExitCode, output);
             }
-            catch { return null; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to run sc.exe {args}.", argText);
+                return null;
+            }
         }
+
+        private static string SystemExe(string fileName) => Path.Combine(Environment.SystemDirectory, fileName);
 
         private void ExecuteSafeCommand(string filename, string[] args, bool suppressErrors = false)
         {
             try
             {
-                var psi = new ProcessStartInfo { FileName = Path.Combine(Environment.SystemDirectory, filename), UseShellExecute = false, CreateNoWindow = true };
-                foreach (var arg in args) psi.ArgumentList.Add(arg);
+                var psi = new ProcessStartInfo { FileName = SystemExe(filename), UseShellExecute = false, CreateNoWindow = true };
+                foreach (var arg in args)
+                {
+                    psi.ArgumentList.Add(arg);
+                }
                 using var proc = Process.Start(psi);
                 proc?.WaitForExit();
             }
