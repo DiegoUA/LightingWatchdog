@@ -8,22 +8,23 @@ All notable changes to LightingWatchdog are documented here.
 
 ### Added
 
-- **Self-Contained Installer Package:** Created an Inno Setup script (`installer/NetworkWatchdogInstaller.iss`) that automatically stops legacy background processes, copies compiled binaries, registers the SCM Background Service, and configures the Tray Application to launch silently at user login. Includes wildcard artifact capturing to prevent missing `.runtimeconfig.json` dependencies.
-- **GitHub Auto-Update Engine:** Natively queries the `LightingWatchdog` GitHub API every 24 hours (or on-demand). Prompts the user, downloads the `.exe` installer asset to `%TEMP%`, and executes a silent overwrite update.
+- **Self-Contained Installer Package:** Created an Inno Setup script (`installer/NetworkWatchdogInstaller.iss`) that automatically stops legacy background processes, copies compiled binaries, registers the SCM Background Service, and configures the Tray Application to launch silently at user login.
+- **GitHub Auto-Update Engine:** Natively queries the `LightingWatchdog` GitHub API every 24 hours (or on-demand), prompts the user, downloads the `.exe` installer asset to `%TEMP%`, and executes a silent overwrite update.
 - **Persistent State Saving:** Introduced `state.json` and a `Save Configuration` button inside the Dashboard to permanently commit Global Threshold limits and Whitelist entries.
 - **Precise Threshold Constraints:** Paired a `NumericUpDown` input box seamlessly with the `Global Max TCP/UDP Connections` slider.
 - **UI Noise Filtration:** Hard-filtered any system process exhibiting fewer than `30` total sockets to declutter the "Live Processes" grid.
 - **Application Icon:** Embedded a native `app.ico` into the TrayApp binary.
-- **Diagnostic Build Markers:** Added a hardcoded `BuildMarker` field to the IPC `TelemetryPacket` and root startup logs to definitively verify CI/CD deployment parity and rule out Windows executable locking issues.
-- **Lowered Diagnostic Threshold:** Lowered the `ResyncGlobalBaseline` native tracking log threshold to `50` rows to grant better visibility into native OS table fetching accuracy vs. live ETW handle deltas.
+- **Diagnostic Build Markers:** Added a hardcoded `BuildMarker` field to the IPC `TelemetryPacket` and root startup logs to definitively verify CI/CD deployment parity.
+
+### Changed
+
+- **Threshold & Polling Tuning:** Lowered the default Global Threshold from `1500` to `1000` to align with strict mitigation targets. Accelerated the periodic baseline resync interval from `60s` to `15s` so rapidly climbing socket leaks are detected and mitigated up to 45 seconds faster.
 
 ### Fixed
 
-- **ERR_NO_BUFFER_SPACE & Protocol Aborts:** Fixed a critical flaw where rapidly growing connection tables outpaced static memory padding, causing the native baseline fetch to continuously fail. The API pipeline now uses dynamic proportional memory padding to successfully capture volatile tables, with failure isolation per protocol family.
-- **Native Table Marshaling & Alignment:** Replaced fragile manual pointer math with safe, managed OS structure marshaling (`Marshal.PtrToStructure`) for `iphlpapi.dll` table iterations across 32-bit and 64-bit architectures, completely eliminating memory offset corruption and socket-counting mismatches.
-- **Background Synchronization Resilience:** Wrapped all baseline resync routines, periodic loops, and ETW handlers in defense-in-depth try/catch blocks (`SafeResyncGlobalBaseline`), ensuring transient OS exceptions or unobserved task failures never silently terminate tracking services.
-- **IPC Telemetry & UI Thread Freezing:** Resolved application freezes and IPC timeouts by removing blocking thread locks during process name resolution and safely caching dead PIDs as `"Terminated"` to bypass expensive exception unwinding loops.
-- **UDP Socket Ignorance:** Integrated `GetExtendedUdpTable` into the core baseline fetcher and bound ETW parsing to `AfdBind` to perfectly track UDP connections.
+- **Bound Socket Leak Blindness (CIM/NSI Migration):** Fixed a critical core flaw where the native `GetExtendedTcpTable` API completely ignored `bind()`-only orphaned sockets (specifically the type leaked by `LightingService`). The primary baseline synchronization engine has been rewritten to use the authoritative CIM/NSI provider (`MSFT_NetTCPConnection`), instantly exposing thousands of previously invisible leaked sockets. The legacy API is now retained solely as a fallback.
+- **Silent Background Task Annihilation:** Resolved a critical stability flaw where unobserved `Task.Run` background threads (specifically the ETW parser and the periodic native table synchronizer) would encounter transient OS exceptions and permanently, silently crash. Strict `try/catch` boundaries (`SafeResyncGlobalBaseline`) now guarantee the synchronization loops survive transient errors and continue executing indefinitely.
+- **IPC Telemetry & UI Thread Freezing:** Resolved severe 1-2 second application hangs inside the Tray Dashboard. The UI serialization layer was attempting to read the names of fast-dying background processes, triggering computationally expensive `ArgumentException` loops. Dead PIDs are now safely cached as `"Terminated"` and instantly bypassed.
 - **Auto-Updater API Mismatch:** Corrected the OTA updater target from `NetworkWatchdog` to `LightingWatchdog` to resolve 404 Not Found API errors.
 - **TrayApp Silent Crash:** Enforced `/p:PublishSingleFile=true` in the GitHub Actions deployment pipeline for the TrayApp to prevent runtime crashes caused by orphaned framework libraries.
 

@@ -48,7 +48,7 @@ namespace NetworkWatchdogService
             "NetworkWatchdogService", "whitelist.json");
         private readonly SemaphoreSlim _whitelistFileLock = new(1, 1);
 
-        private volatile int _globalMaxTcpConnections = 1500;
+        private volatile int _globalMaxTcpConnections = 1000;
         private readonly object _connectionCountsLock = new();
 
         private readonly record struct AfdEvent(int ProcessId, bool IsConnect);
@@ -170,7 +170,14 @@ namespace NetworkWatchdogService
         {
             while (!token.IsCancellationRequested)
             {
-                await Task.Delay(TimeSpan.FromSeconds(60), token);
+                // Was 60s. At 60s, a leak crossing the 1000 threshold could sit
+                // undetected for up to ~65s (this interval plus the 5s detection
+                // poll) before a restart even triggers. 15s keeps that worst case
+                // closer to ~20s. If CIM query cost at your actual connection
+                // volume turns out to be high enough to matter, this is the
+                // number to raise - watch the resync log timestamps after
+                // deploying to confirm each cycle finishes well under 15s.
+                await Task.Delay(TimeSpan.FromSeconds(15), token);
                 SafeResyncGlobalBaseline("periodic");
             }
         }
@@ -253,15 +260,49 @@ namespace NetworkWatchdogService
         }
 
         /// <summary>
-        /// Diagnostic only: logs the native table row count for whichever PID(s)
-        /// currently belong to a process with this name. Resolved by name every
-        /// call rather than cached, since the whole point is surviving restarts
-        /// (and therefore PID changes) without needing a code edit/redeploy. If
-        /// the process restarts mid-leak you may briefly see it logged under two
-        /// PIDs (the dying one and its replacement) in the same cycle - that's
-        /// expected, not a bug.
+        /// Counts TCP rows per owning PID via the same CIM provider
+        /// (root\StandardCimv2:MSFT_NetTCPConnection) that Get-NetTCPConnection
+        /// itself queries. This is now the authoritative source for
+        /// leak detection: unlike the legacy GetExtendedTcpTable fetch, it sees
+        /// "Bound" sockets - bind() with no connect/listen/close - which is
+        /// exactly the pattern LightingService's leak produces. Returns null
+        /// on failure so the caller can fall back rather than silently zeroing
+        /// out every tracked PID.
         /// </summary>
-        private void LogNativeCountForWatchedProcess(Dictionary<int, int> counts, string processName)
+        private Dictionary<int, int>? GetTcpConnectionCountsViaCim()
+        {
+            var counts = new Dictionary<int, int>();
+            try
+            {
+                using var searcher = new ManagementObjectSearcher(
+                    @"root\StandardCimv2",
+                    "SELECT OwningProcess FROM MSFT_NetTCPConnection");
+                using var results = searcher.Get();
+
+                foreach (ManagementObject obj in results.Cast<ManagementObject>())
+                {
+                    if (obj["OwningProcess"] is uint pid)
+                    {
+                        counts[(int)pid] = counts.TryGetValue((int)pid, out int c) ? c + 1 : 1;
+                    }
+                    obj.Dispose();
+                }
+                return counts;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "CIM/NSI query for MSFT_NetTCPConnection failed.");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Logs the count this cycle's fetch saw for whichever PID(s) currently
+        /// belong to a process with this name. Resolved by name every call, not
+        /// cached, so it survives the process restarting (and therefore getting
+        /// a new PID) without a code edit/redeploy.
+        /// </summary>
+        private void LogCountForWatchedProcess(Dictionary<int, int> counts, string processName, bool usedFallback)
         {
             Process[] matches;
             try
@@ -285,8 +326,10 @@ namespace NetworkWatchdogService
                 foreach (var proc in matches)
                 {
                     int pid = proc.Id;
-                    _logger.LogCritical("Baseline resync: {name} (PID {pid}) = {val} native TCP table rows.",
-                        processName, pid, counts.TryGetValue(pid, out int val) ? val.ToString() : "not present in native table");
+                    _logger.LogCritical("Baseline resync: {name} (PID {pid}) = {val} ({source}).",
+                        processName, pid,
+                        counts.TryGetValue(pid, out int val) ? val.ToString() : "not present",
+                        usedFallback ? "legacy GetExtendedTcpTable fallback" : "CIM/NSI");
                 }
             }
             finally
@@ -297,24 +340,35 @@ namespace NetworkWatchdogService
 
         private void ResyncGlobalBaseline()
         {
-            _logger.LogCritical("Resyncing socket baselines via IP Helper API...");
-            var counts = new Dictionary<int, int>();
-            try
+            _logger.LogCritical("Resyncing socket baselines...");
+
+            // CIM/NSI first - this is what actually sees LightingService's
+            // leaked Bound sockets. Only fall back to the legacy IP Helper
+            // table if CIM itself is unavailable, so detection degrades
+            // instead of going blind.
+            var counts = GetTcpConnectionCountsViaCim();
+            bool usedFallback = false;
+
+            if (counts == null)
             {
-                counts = GetNativeTcpConnectionCounts();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogCritical(ex, "Failed to execute native TCP table baseline fetch.");
-                return;
+                try
+                {
+                    counts = GetNativeTcpConnectionCounts();
+                    usedFallback = true;
+                    _logger.LogCritical("CIM/NSI query failed; fell back to GetExtendedTcpTable, which will UNDERCOUNT bind()-only leaked sockets.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogCritical(ex, "Both CIM/NSI and the legacy native TCP table fetch failed this cycle; baseline not updated.");
+                    return;
+                }
             }
 
             // Unconditional, every cycle, regardless of threshold: proves the
-            // fetch ran and shows exactly what it saw for the watched process,
-            // present or not. Looked up by name, not a hardcoded PID - PIDs are
-            // reassigned every time the process restarts, so a literal number
-            // here would need editing (and redeploying) after every restart.
-            LogNativeCountForWatchedProcess(counts, "LightingService");
+            // fetch ran and shows exactly what it's seeing for the watched
+            // process. Looked up by name, not a hardcoded PID - PIDs are
+            // reassigned every time the process restarts.
+            LogCountForWatchedProcess(counts, "LightingService", usedFallback);
 
             lock (_connectionCountsLock)
             {
