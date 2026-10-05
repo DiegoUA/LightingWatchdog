@@ -4,6 +4,15 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.7.1] - 2026-10-06
+
+### Fixed
+
+- **TrayApp Thread-Safety & UI Deadlocks:** Resolved critical WinForms stability bugs causing the TrayApp to crash or freeze. IPC NamedPipe queries were moved from the threshold slider's continuous `ValueChanged` event to `MouseUp` to prevent synchronous thread-blocking. `ContextMenuStrip` destruction is now safely deferred to the message pump (`Task.Delay(500)`), eliminating `ObjectDisposedException` race conditions.
+- **Async Void Timer Crashes:** Wrapped the auto-updater's asynchronous timer tick in strict `try/catch` boundaries to prevent unhandled network timeouts from silently crashing the host process.
+- **Startup Handle Exceptions:** Fixed a race condition where the auto-updater attempted to invoke the UI thread before window handles were fully created.
+- **Auto-Updater TrayApp Respawning:** Fixed an issue where the silent Inno Setup execution (`/SILENT`) failed to relaunch the TrayApp into the user session after an OTA update. Modified the installer script `[Run]` flags to enforce `runasoriginaluser`.
+
 ## [3.7.0] - 2026-10-06
 
 ### Added

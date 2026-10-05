@@ -41,7 +41,7 @@ namespace NetworkWatchdog.TrayApp
         private readonly Font _boldFont;
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private extern static bool DestroyIcon(IntPtr handle);
+        private static extern bool DestroyIcon(IntPtr handle);
 
         public TrayApplicationContext()
         {
@@ -66,15 +66,17 @@ namespace NetworkWatchdog.TrayApp
             _timer.Start();
 
             _updateTimer = new System.Windows.Forms.Timer { Interval = 86400000 };
-            _updateTimer.Tick += async (s, e) => await GitHubAutoUpdater.CheckForUpdatesAsync();
+            _updateTimer.Tick += async (s, e) => 
+            {
+                try { await GitHubAutoUpdater.CheckForUpdatesAsync(); } catch { }
+            };
             _updateTimer.Start();
 
-            Task.Delay(5000).ContinueWith(async _ => 
+            // Safe startup check delay without raw thread invocations
+            _ = Task.Run(async () =>
             {
-                if (_trayIcon.ContextMenuStrip != null)
-                {
-                    _trayIcon.ContextMenuStrip.Invoke(new Action(async () => await GitHubAutoUpdater.CheckForUpdatesAsync()));
-                }
+                await Task.Delay(5000);
+                await GitHubAutoUpdater.CheckForUpdatesAsync();
             });
         }
 
@@ -134,7 +136,8 @@ namespace NetworkWatchdog.TrayApp
 
             if (oldMenu != null)
             {
-                oldMenu.Dispose();
+                // Delay disposal to ensure message pump finishes processing current context menu operations safely
+                Task.Delay(500).ContinueWith(_ => oldMenu.Dispose());
             }
         }
 
@@ -228,7 +231,11 @@ namespace NetworkWatchdog.TrayApp
         private void UpdateUiFromTelemetry(TelemetryPacket packet)
         {
             var elevated = packet.Processes.Where(p => p.Connections >= 500).OrderByDescending(p => p.Connections).ToList();
-            RebuildContextMenu(elevated);
+            
+            if (_trayIcon.ContextMenuStrip == null || !_trayIcon.ContextMenuStrip.Visible)
+            {
+                RebuildContextMenu(elevated);
+            }
 
             var worst = packet.Processes.OrderByDescending(p => p.Connections).First();
             Icon targetIcon = worst.Connections < 500 ? _iconGreen : (worst.Connections < 1000 ? _iconOrange : _iconRed);
@@ -271,7 +278,7 @@ namespace NetworkWatchdog.TrayApp
     {
         private const string RepoOwner = "DiegoUA";
         private const string RepoName = "LightingWatchdog"; 
-        private const string CurrentVersion = "v3.6.0"; 
+        private const string CurrentVersion = "v3.7.0"; 
 
         public static async Task CheckForUpdatesAsync(bool manualCheck = false)
         {
@@ -417,7 +424,7 @@ namespace NetworkWatchdog.TrayApp
             _numThreshold = new NumericUpDown { Top = 40, Left = 330, Width = 80, Minimum = 200, Maximum = 10000 };
             var btnSaveConfig = new Button { Text = "Save Configuration", Top = 38, Left = 430, Width = 150 };
 
-            _sliderThreshold.ValueChanged += (s, e) =>
+            _sliderThreshold.MouseUp += (s, e) =>
             {
                 if (_numThreshold.Value != _sliderThreshold.Value)
                     _numThreshold.Value = _sliderThreshold.Value;
@@ -478,12 +485,25 @@ namespace NetworkWatchdog.TrayApp
 
         public void RefreshData(TelemetryPacket packet)
         {
+            int procScroll = _gridProcesses.FirstDisplayedScrollingRowIndex;
+            var procSelected = _gridProcesses.SelectedRows.Count > 0 ? _gridProcesses.SelectedRows[0].Cells["Pid"].Value?.ToString() : null;
+
             _gridProcesses.Rows.Clear();
             foreach (var item in packet.Processes.OrderByDescending(p => p.Connections))
             {
-                _gridProcesses.Rows.Add(item.ServiceName, item.Pid, item.Connections, item.Status);
+                int rowIndex = _gridProcesses.Rows.Add(item.ServiceName, item.Pid, item.Connections, item.Status);
+                if (procSelected != null && item.Pid.ToString() == procSelected)
+                {
+                    _gridProcesses.Rows[rowIndex].Selected = true;
+                }
             }
 
+            if (procScroll >= 0 && _gridProcesses.Rows.Count > 0)
+            {
+                _gridProcesses.FirstDisplayedScrollingRowIndex = Math.Min(procScroll, _gridProcesses.Rows.Count - 1);
+            }
+
+            int restScroll = _gridRestarts.FirstDisplayedScrollingRowIndex;
             _gridRestarts.Rows.Clear();
             foreach (var log in packet.RecentRestarts)
             {
@@ -492,6 +512,11 @@ namespace NetworkWatchdog.TrayApp
                 {
                     _gridRestarts.Rows.Add(parts[0], parts[1], parts[2], parts[3]);
                 }
+            }
+
+            if (restScroll >= 0 && _gridRestarts.Rows.Count > 0)
+            {
+                _gridRestarts.FirstDisplayedScrollingRowIndex = Math.Min(restScroll, _gridRestarts.Rows.Count - 1);
             }
 
             if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum && packet.GlobalMaxTcpConnections <= _sliderThreshold.Maximum)
