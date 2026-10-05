@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Management;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -16,6 +17,8 @@ using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using NetworkWatchdogService.Models;
 
 namespace NetworkWatchdogService
 {
@@ -27,6 +30,81 @@ namespace NetworkWatchdogService
         private const int AF_INET = 2;
         private const int AF_INET6 = 23;
         private const int TCP_TABLE_OWNER_PID_ALL = 5;
+
+        // --- Windows Restart Manager (rstrtmgr.dll) ---
+        //
+        // HIGH-RISK, UNVERIFIED NATIVE INTEROP. This has NOT been compiled or run
+        // against a real Windows machine from this environment - it is written
+        // against the widely-published, long-standing reference shape for this
+        // API (the same struct layout/signatures reproduced across numerous
+        // vetted samples), but has not been tested here. Before relying on this
+        // in production, verify on a real box that:
+        //   (a) it builds without marshaling warnings,
+        //   (b) RmGetList returns the PIDs you expect for a known locked file
+        //       (e.g. run it against a file you've deliberately left open in
+        //       another process), and
+        //   (c) nothing it returns gets killed incorrectly.
+        // This is exactly the class of bug (silently wrong, not crashing) this
+        // codebase has already been burned by twice. It is deliberately wired as
+        // an ADDITIVE safety layer, not a replacement for the existing taskkill
+        // /T of the primary target: if the RM query fails for any reason, the
+        // code logs and continues with just the original single-target kill
+        // rather than blocking or crashing the restart.
+        private const int CCH_RM_SESSION_KEY = 32;
+        private const int CCH_RM_MAX_APP_NAME = 255;
+        private const int CCH_RM_MAX_SVC_NAME = 63;
+
+        private enum RM_APP_TYPE
+        {
+            RmUnknownApp = 0,
+            RmMainWindow = 1,
+            RmOtherWindow = 2,
+            RmService = 3,
+            RmExplorer = 4,
+            RmConsole = 5,
+            RmCritical = 1000
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RM_UNIQUE_PROCESS
+        {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct RM_PROCESS_INFO
+        {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+            public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+            public string strServiceShortName;
+            public RM_APP_TYPE ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmEndSession(uint pSessionHandle);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmRegisterResources(uint pSessionHandle,
+            uint nFiles, string[]? rgsFilenames,
+            uint nApplications, RM_UNIQUE_PROCESS[]? rgApplications,
+            uint nServices, string[]? rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmGetList(uint dwSessionHandle,
+            out uint pnProcInfoNeeded,
+            ref uint pnProcInfo,
+            [In, Out] RM_PROCESS_INFO[]? rgAffectedApps,
+            ref uint lpdwRebootReasons);
 
         private readonly ILogger<Worker> _logger;
         private TraceEventSession? _etwSession;
@@ -48,7 +126,29 @@ namespace NetworkWatchdogService
             "NetworkWatchdogService", "whitelist.json");
         private readonly SemaphoreSlim _whitelistFileLock = new(1, 1);
 
+        // Persisted separately from whitelist.json (same directory, same ACL
+        // lockdown, same atomic-write pattern) rather than rewriting
+        // appsettings.json in place at runtime - mutating the deployed config
+        // file risks fighting an installer/GPO/config-management tool that
+        // also owns it. This file holds only the small set of values the
+        // TrayApp's "Save Configuration" button is meant to persist; it is an
+        // override layered on top of appsettings.json at startup, not a
+        // replacement for it.
+        private readonly string _runtimeOverridesFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "NetworkWatchdogService", "runtime-overrides.json");
+        private readonly SemaphoreSlim _runtimeOverridesFileLock = new(1, 1);
+
+        // Fallback only - overwritten from WatchdogConfig.GlobalMaxTcpConnections
+        // in the constructor. Kept as a sane default in case config binding ever
+        // fails to populate (e.g. missing section).
         private volatile int _globalMaxTcpConnections = 1000;
+
+        // Dashboard/telemetry display filter only - processes at or below this
+        // are hidden from the Live Processes view. Detection and restart logic
+        // is unaffected: every tracked PID is still checked against its
+        // resolved threshold regardless of this value.
+        private const int TelemetryDisplayThreshold = 30;
         private readonly object _connectionCountsLock = new();
 
         private readonly record struct AfdEvent(int ProcessId, bool IsConnect);
@@ -56,22 +156,157 @@ namespace NetworkWatchdogService
         // Bumped every time this file changes, logged loudly at startup and
         // exposed in telemetry, so you can tell at a glance - from the
         // service's own log or the dashboard itself - whether the process
-        // that's actually running matches the source you just built. Given
-        // that none of the last several fixes changed the observed behavior
-        // at all, confirming this before chasing another code theory will
-        // save us both time if the real issue turns out to be a stale build.
-        private const string BuildMarker = "2026-10-02-diag1";
+        // that's actually running matches the source you just built.
+        private const string BuildMarker = "2026-10-03-config1";
 
-        public Worker(ILogger<Worker> logger)
+        private readonly WatchdogConfig _config;
+
+        // Case-insensitive lookup from a process name (either a MonitoredServices
+        // ServiceName or any name in its ProcessTree) to that service's config
+        // entry, built once at startup. Used to resolve per-service threshold
+        // overrides and the EnableRestart toggle.
+        private readonly Dictionary<string, MonitoredService> _serviceConfigByProcessName;
+
+        // Cheap pre-filter for the 5-second detection loop: the lowest threshold
+        // any process could possibly be held to (global or any per-service
+        // override, whichever is smaller). A PID below this can never breach
+        // any applicable threshold, so its name/config never needs resolving -
+        // this keeps the hot path cheap even with MonitorAllProcesses=true and
+        // CIM reporting counts for every process on the box.
+        private readonly int _minPossibleThreshold;
+
+        // Cooldown: minimum time between restart *attempts* of the same service
+        // name (not PID - PIDs change every restart). Keyed by the clean process
+        // name actually used to trigger the restart.
+        private readonly ConcurrentDictionary<string, DateTime> _lastRestartAttempt = new(StringComparer.OrdinalIgnoreCase);
+
+        // Quarantine: rolling history of restart-attempt timestamps per service
+        // name, used to detect "restarted too many times too recently" without
+        // any separate sticky "quarantined" flag - see IsQuarantined for why.
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<DateTime>> _restartHistory = new(StringComparer.OrdinalIgnoreCase);
+
+        public Worker(ILogger<Worker> logger, IOptions<WatchdogConfig> options)
         {
             _logger = logger;
+            _config = options.Value ?? new WatchdogConfig();
+            _globalMaxTcpConnections = _config.GlobalMaxTcpConnections;
+
+            _serviceConfigByProcessName = new Dictionary<string, MonitoredService>(StringComparer.OrdinalIgnoreCase);
+            foreach (var svc in _config.MonitoredServices)
+            {
+                if (!string.IsNullOrWhiteSpace(svc.ServiceName))
+                    _serviceConfigByProcessName[svc.ServiceName] = svc;
+                foreach (var name in svc.ProcessTree)
+                    if (!string.IsNullOrWhiteSpace(name))
+                        _serviceConfigByProcessName[name] = svc;
+            }
+
+            _minPossibleThreshold = _config.MonitoredServices.Count > 0
+                ? Math.Min(_config.GlobalMaxTcpConnections, _config.MonitoredServices.Min(s => s.MaxTcpConnections))
+                : _config.GlobalMaxTcpConnections;
+        }
+
+        /// <summary>
+        /// Resolves the connection threshold and restart permission that apply
+        /// to a given process name: a per-service override from MonitoredServices
+        /// if one matches (by ServiceName or ProcessTree membership), else the
+        /// global default with restarts enabled.
+        /// </summary>
+        private (int Threshold, bool RestartEnabled, string? ServiceGroupName) ResolveThresholdForProcess(string cleanName)
+        {
+            if (_serviceConfigByProcessName.TryGetValue(cleanName, out var svc))
+                return (svc.MaxTcpConnections, svc.EnableRestart, svc.ServiceName);
+            return (_globalMaxTcpConnections, true, null);
+        }
+
+        private string GetOrCacheProcessName(int pid, Process proc)
+        {
+            if (_processNameCache.TryGetValue(pid, out string? cached)) return cached;
+            string name = proc.ProcessName;
+            _processNameCache[pid] = name;
+            return name;
+        }
+
+        // --- Syslog (RFC 3164, UDP) ---
+        //
+        // WatchdogConfig.Syslog existed as a data holder with nothing reading it;
+        // this is that missing consumer. Deliberately UDP and fire-and-forget: a
+        // syslog server being down or unreachable must never block or throw from
+        // detection/restart logic, so every failure path here only logs locally
+        // and continues. Deliberately NOT a mirror of every log line - only the
+        // handful of events below that represent a meaningful state change
+        // someone monitoring centrally would actually want to see, to avoid
+        // turning this into log spam at your real connection-count volumes.
+        private UdpClient? _syslogClient;
+        private readonly object _syslogInitLock = new();
+
+        private enum SyslogSeverity { Emergency = 0, Alert = 1, Critical = 2, Error = 3, Warning = 4, Notice = 5, Informational = 6, Debug = 7 }
+
+        private void EnsureSyslogClient()
+        {
+            if (!_config.Syslog.Enabled || _syslogClient != null) return;
+
+            lock (_syslogInitLock)
+            {
+                if (_syslogClient != null) return;
+                try
+                {
+                    var client = new UdpClient();
+                    client.Connect(_config.Syslog.ServerIp, _config.Syslog.Port);
+                    _syslogClient = client;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to initialize syslog UDP client for {ip}:{port}; syslog forwarding disabled for this session.",
+                        _config.Syslog.ServerIp, _config.Syslog.Port);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sends one RFC 3164 formatted line via UDP to the configured syslog
+        /// server. Facility is fixed at local0 (16), which is conventional for
+        /// an application-specific daemon with no more specific facility of its
+        /// own. No-op (and cheap) when Syslog.Enabled is false.
+        /// </summary>
+        private void SendSyslog(SyslogSeverity severity, string message)
+        {
+            if (!_config.Syslog.Enabled) return;
+            EnsureSyslogClient();
+            if (_syslogClient == null) return;
+
+            try
+            {
+                const int facility = 16; // local0
+                int priority = facility * 8 + (int)severity;
+
+                // RFC 3164 wants the day-of-month space-padded (not zero-padded)
+                // to two characters, e.g. "Oct  4" not "Oct 04".
+                string timestamp = DateTime.Now.ToString("MMM dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+                if (timestamp.Length > 4 && timestamp[4] == '0')
+                {
+                    var chars = timestamp.ToCharArray();
+                    chars[4] = ' ';
+                    timestamp = new string(chars);
+                }
+
+                string line = $"<{priority}>{timestamp} {Environment.MachineName} NetworkWatchdogService: {message}";
+                byte[] bytes = Encoding.ASCII.GetBytes(line);
+                _syslogClient.Send(bytes, bytes.Length);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send syslog message.");
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogCritical("Starting NetworkWatchdogService Worker. BuildMarker={marker}", BuildMarker);
+            SendSyslog(SyslogSeverity.Informational, $"NetworkWatchdogService starting (BuildMarker={BuildMarker}).");
 
             LoadWhitelistFromDisk();
+            LoadRuntimeOverrides();
             SafeResyncGlobalBaseline("startup");
 
             _ = Task.Run(() => ProcessEtwChannelAsync(stoppingToken), stoppingToken);
@@ -87,61 +322,153 @@ namespace NetworkWatchdogService
                 foreach (int pid in currentPids)
                 {
                     if (_activeRestarts.ContainsKey(pid)) continue;
+                    if (!_pidConnectionCounts.TryGetValue(pid, out int currentConnections)) continue;
 
-                    if (_pidConnectionCounts.TryGetValue(pid, out int currentConnections))
+                    // Cheap pre-filter: below the lowest threshold any process could
+                    // possibly be held to, so there is nothing to resolve or check.
+                    if (currentConnections <= _minPossibleThreshold) continue;
+
+                    try
                     {
-                        if (currentConnections > _globalMaxTcpConnections)
+                        using var proc = Process.GetProcessById(pid);
+                        DateTime currentStartTime = proc.StartTime;
+
+                        if (_pidStartTimes.TryGetValue(pid, out DateTime knownStartTime))
                         {
-                            try
+                            if (currentStartTime != knownStartTime)
                             {
-                                using var proc = Process.GetProcessById(pid);
-                                DateTime currentStartTime = proc.StartTime; 
-
-                                if (_pidStartTimes.TryGetValue(pid, out DateTime knownStartTime))
-                                {
-                                    if (currentStartTime != knownStartTime)
-                                    {
-                                        _logger.LogInformation("PID {pid} was reused. Resetting tracking states.", pid);
-                                        _pidConnectionCounts.TryRemove(pid, out _);
-                                        _pidStartTimes[pid] = currentStartTime;
-                                        _processNameCache.TryRemove(pid, out _);
-                                        _serviceNameCache.TryRemove(pid, out _);
-                                        continue;
-                                    }
-                                }
-                                else
-                                {
-                                    _pidStartTimes[pid] = currentStartTime;
-                                }
-
-                                string procName = proc.ProcessName;
-                                string cleanName = Path.GetFileNameWithoutExtension(procName);
-                                if (_whitelist.ContainsKey(cleanName) || _whitelist.ContainsKey(procName)) 
-                                    continue;
-
-                                // Temporarily LogCritical, not LogWarning: your Event Log provider is
-                                // filtering out Warning/Information entirely (confirmed - only Critical
-                                // came through), so this and the other lines below are bumped purely so
-                                // we can actually see them while we diagnose. Revert once we're done.
-                                _logger.LogCritical("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid}!", currentConnections, _globalMaxTcpConnections, proc.Id);
-                                
-                                _activeRestarts.TryAdd(pid, DateTime.UtcNow);
-                                
-                                _ = RestartLeakingServiceAsync(procName, proc.Id, currentConnections, currentStartTime);
-                            }
-                            catch (Exception)
-                            {
+                                _logger.LogInformation("PID {pid} was reused. Resetting tracking states.", pid);
                                 _pidConnectionCounts.TryRemove(pid, out _);
-                                _pidStartTimes.TryRemove(pid, out _);
+                                _pidStartTimes[pid] = currentStartTime;
                                 _processNameCache.TryRemove(pid, out _);
                                 _serviceNameCache.TryRemove(pid, out _);
+                                continue;
                             }
                         }
+                        else
+                        {
+                            _pidStartTimes[pid] = currentStartTime;
+                        }
+
+                        string procName = GetOrCacheProcessName(pid, proc);
+                        string cleanName = Path.GetFileNameWithoutExtension(procName);
+
+                        if (_whitelist.ContainsKey(cleanName) || _whitelist.ContainsKey(procName))
+                            continue;
+
+                        var (threshold, restartEnabled, serviceGroupName) = ResolveThresholdForProcess(cleanName);
+
+                        // MonitorAllProcesses=false: only processes configured in
+                        // MonitoredServices are tracked for restart purposes at all,
+                        // regardless of how high an unconfigured process's count is.
+                        if (!_config.MonitorAllProcesses && serviceGroupName == null)
+                            continue;
+
+                        if (currentConnections <= threshold) continue;
+
+                        // The name used for cooldown/quarantine bookkeeping and logging:
+                        // the configured service group name if this process belongs to
+                        // one, otherwise its own clean process name. This is what makes
+                        // cooldown/quarantine apply per logical service, not per PID.
+                        string bookkeepingName = serviceGroupName ?? cleanName;
+
+                        _logger.LogCritical("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid} ({name})!",
+                            currentConnections, threshold, proc.Id, bookkeepingName);
+                        SendSyslog(SyslogSeverity.Warning, $"Socket leak breach: {bookkeepingName} (PID {proc.Id}) has {currentConnections} connections, threshold {threshold}.");
+
+                        if (!restartEnabled)
+                        {
+                            _logger.LogWarning("EnableRestart is false for {name}; leak detected but not acting.", bookkeepingName);
+                            continue;
+                        }
+
+                        if (IsInCooldown(bookkeepingName, out TimeSpan remaining))
+                        {
+                            // Not sent to syslog: this can repeat every 5s while a
+                            // service sits in cooldown, which would spam a central
+                            // log server with no new information each time.
+                            _logger.LogInformation("{name} breached its threshold again but is still in cooldown for {remaining}s; not restarting yet.",
+                                bookkeepingName, (int)remaining.TotalSeconds);
+                            continue;
+                        }
+
+                        if (_config.EnableQuarantine && IsQuarantined(bookkeepingName, out int recentCount))
+                        {
+                            _logger.LogCritical("QUARANTINED: {name} has restarted {count} times in the last {window} minute(s) (limit {limit}). " +
+                                "Not auto-restarting - this needs manual investigation.",
+                                bookkeepingName, recentCount, _config.QuarantineWindowMinutes, _config.QuarantineRestartLimit);
+                            SendSyslog(SyslogSeverity.Alert, $"QUARANTINED: {bookkeepingName} restarted {recentCount} times in the last {_config.QuarantineWindowMinutes} minute(s); auto-restart suspended, manual investigation needed.");
+                            continue;
+                        }
+
+                        RecordRestartAttempt(bookkeepingName);
+                        _activeRestarts.TryAdd(pid, DateTime.UtcNow);
+                        SendSyslog(SyslogSeverity.Notice, $"Restarting {bookkeepingName} (PID {proc.Id}) due to socket leak ({currentConnections} connections).");
+
+                        _ = RestartLeakingServiceAsync(procName, proc.Id, currentConnections, currentStartTime);
+                    }
+                    catch (Exception)
+                    {
+                        _pidConnectionCounts.TryRemove(pid, out _);
+                        _pidStartTimes.TryRemove(pid, out _);
+                        _processNameCache.TryRemove(pid, out _);
+                        _serviceNameCache.TryRemove(pid, out _);
                     }
                 }
 
                 await Task.Delay(5000, stoppingToken);
             }
+        }
+
+        /// <summary>
+        /// True if this service name attempted a restart within CooldownSeconds.
+        /// Distinct from quarantine: cooldown is a short, per-attempt throttle
+        /// (avoid re-triggering every 5s while the previous restart is still
+        /// settling); quarantine is the longer-window "this keeps happening,
+        /// stop trying" circuit breaker.
+        /// </summary>
+        private bool IsInCooldown(string serviceName, out TimeSpan remaining)
+        {
+            remaining = TimeSpan.Zero;
+            if (!_lastRestartAttempt.TryGetValue(serviceName, out DateTime last)) return false;
+
+            var elapsed = DateTime.UtcNow - last;
+            var cooldown = TimeSpan.FromSeconds(Math.Max(0, _config.CooldownSeconds));
+            if (elapsed >= cooldown) return false;
+
+            remaining = cooldown - elapsed;
+            return true;
+        }
+
+        /// <summary>
+        /// Rolling-window check, not a sticky flag: counts restart attempts for
+        /// this service name within the last QuarantineWindowMinutes. No separate
+        /// "quarantined" state is stored, so there is nothing to get stuck or to
+        /// need manually clearing - once enough time passes for old attempts to
+        /// age out of the window, restarts are simply allowed again on their own.
+        /// </summary>
+        private bool IsQuarantined(string serviceName, out int recentCount)
+        {
+            recentCount = 0;
+            if (!_restartHistory.TryGetValue(serviceName, out var history)) return false;
+
+            var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(Math.Max(0, _config.QuarantineWindowMinutes));
+            recentCount = history.Count(t => t >= cutoff);
+            return recentCount >= Math.Max(1, _config.QuarantineRestartLimit);
+        }
+
+        private void RecordRestartAttempt(string serviceName)
+        {
+            _lastRestartAttempt[serviceName] = DateTime.UtcNow;
+
+            var history = _restartHistory.GetOrAdd(serviceName, _ => new ConcurrentQueue<DateTime>());
+            history.Enqueue(DateTime.UtcNow);
+
+            // Trim opportunistically so this can't grow without bound for a
+            // service that restarts constantly over a long uptime.
+            var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(Math.Max(1, _config.QuarantineWindowMinutes) * 4);
+            while (history.TryPeek(out DateTime oldest) && oldest < cutoff)
+                history.TryDequeue(out _);
         }
 
         private async Task ProcessEtwChannelAsync(CancellationToken token)
@@ -170,14 +497,15 @@ namespace NetworkWatchdogService
         {
             while (!token.IsCancellationRequested)
             {
-                // Was 60s. At 60s, a leak crossing the 1000 threshold could sit
-                // undetected for up to ~65s (this interval plus the 5s detection
-                // poll) before a restart even triggers. 15s keeps that worst case
-                // closer to ~20s. If CIM query cost at your actual connection
-                // volume turns out to be high enough to matter, this is the
-                // number to raise - watch the resync log timestamps after
-                // deploying to confirm each cycle finishes well under 15s.
-                await Task.Delay(TimeSpan.FromSeconds(15), token);
+                // Config-driven (WatchdogConfig.WatchdogIntervalSeconds, default 15s).
+                // At 60s, a leak crossing the threshold could sit undetected for up
+                // to ~65s (this interval plus the 5s detection poll) before a restart
+                // even triggers; 15s keeps that worst case closer to ~20s. If CIM
+                // query cost at your actual connection volume turns out to be high
+                // enough to matter, raise WatchdogIntervalSeconds in appsettings.json -
+                // watch the resync log timestamps after deploying to confirm each
+                // cycle finishes well under this interval.
+                await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.WatchdogIntervalSeconds)), token);
                 SafeResyncGlobalBaseline("periodic");
             }
         }
@@ -360,6 +688,7 @@ namespace NetworkWatchdogService
                 catch (Exception ex)
                 {
                     _logger.LogCritical(ex, "Both CIM/NSI and the legacy native TCP table fetch failed this cycle; baseline not updated.");
+                    SendSyslog(SyslogSeverity.Error, $"Baseline resync failed completely this cycle (both CIM/NSI and legacy fetch failed): {ex.Message}");
                     return;
                 }
             }
@@ -665,6 +994,15 @@ namespace NetworkWatchdogService
                     continue;
                 }
 
+                // Display filter only - this does NOT affect detection. Every
+                // PID in _pidConnectionCounts, including ones below this, is
+                // still checked against _globalMaxTcpConnections in the main
+                // detection loop and can still trigger a restart; this just
+                // keeps idle/low-connection processes (wininit with 2
+                // connections, etc.) off the dashboard so only processes worth
+                // looking at show up.
+                if (kvp.Value <= TelemetryDisplayThreshold) continue;
+
                 string status = kvp.Value < 500 ? "Healthy" : (kvp.Value < _globalMaxTcpConnections ? "Elevated" : "CRITICAL LEAK");
                 packet.Processes.Add(new ProcessTelemetryItem
                 {
@@ -709,6 +1047,16 @@ namespace NetworkWatchdogService
             {
                 _ = SaveWhitelistToDiskAsync();
             }
+
+            if (cmd.SaveRequested == true)
+            {
+                // Re-save the whitelist too, not just the threshold: harmless if
+                // it's already current, and gives the user a working retry via
+                // the UI if an earlier auto-save after Add/Remove ever failed.
+                _ = SaveWhitelistToDiskAsync();
+                _ = SaveRuntimeOverridesAsync();
+                _logger.LogInformation("IPC: Save Configuration requested - persisting current threshold and whitelist.");
+            }
         }
 
         private const long MaxWhitelistFileBytes = 1024 * 1024;
@@ -730,6 +1078,20 @@ namespace NetworkWatchdogService
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
         private void LoadWhitelistFromDisk()
         {
+            // Config-seeded defaults (WatchdogConfig.ProcessWhitelist, e.g. chrome/
+            // firefox/msedge/steam/Discord) are applied first, every startup,
+            // regardless of whether the persisted whitelist.json exists yet. This
+            // does NOT replace the persisted/ACL-locked whitelist mechanism below -
+            // it just guarantees sane common defaults are present even on a brand
+            // new install before anyone has added anything via IPC. Entries added
+            // at runtime still only persist through the existing whitelist.json
+            // save path, not back into appsettings.json.
+            foreach (var seed in _config.ProcessWhitelist)
+            {
+                if (TryNormalizeWhitelistEntry(seed, out string entry))
+                    _whitelist.TryAdd(entry, 1);
+            }
+
             try
             {
                 if (!File.Exists(_whitelistFilePath)) return;
@@ -909,6 +1271,112 @@ namespace NetworkWatchdogService
             finally
             {
                 _whitelistFileLock.Release();
+            }
+        }
+
+        private class RuntimeOverrides
+        {
+            public int? GlobalMaxTcpConnections { get; set; }
+        }
+
+        /// <summary>
+        /// Applies any previously-saved runtime override on top of the value
+        /// bound from appsettings.json. Same ACL verification discipline as
+        /// LoadWhitelistFromDisk: refuses to trust the file unless its
+        /// directory is admin/SYSTEM-only, failing closed to "use the
+        /// appsettings.json value" rather than trusting a tampered override.
+        /// </summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private void LoadRuntimeOverrides()
+        {
+            try
+            {
+                if (!File.Exists(_runtimeOverridesFilePath)) return;
+
+                string? dir = Path.GetDirectoryName(_runtimeOverridesFilePath);
+                if (string.IsNullOrEmpty(dir) ||
+                    !IsAdminOnlyLocation(dir, isDirectory: true) ||
+                    !IsAdminOnlyLocation(_runtimeOverridesFilePath, isDirectory: false))
+                {
+                    _logger.LogCritical("Refusing to load runtime overrides from {path}: file or directory is not exclusively owned/writable by Administrators or SYSTEM. Using appsettings.json values only.", _runtimeOverridesFilePath);
+                    return;
+                }
+
+                var overrides = JsonSerializer.Deserialize<RuntimeOverrides>(File.ReadAllText(_runtimeOverridesFilePath));
+                if (overrides?.GlobalMaxTcpConnections is int saved && saved >= 200 && saved <= 10000)
+                {
+                    _globalMaxTcpConnections = saved;
+                    _logger.LogInformation("Applied saved runtime override: GlobalMaxTcpConnections={val} (from {path}).", saved, _runtimeOverridesFilePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load runtime overrides from {path}; using appsettings.json values only.", _runtimeOverridesFilePath);
+            }
+        }
+
+        /// <summary>
+        /// Persists the current in-memory threshold so it survives a service
+        /// restart, without touching appsettings.json itself. Triggered by
+        /// ConfigUpdateCommand.SaveRequested (the TrayApp's "Save
+        /// Configuration" button). Same atomic-write pattern as
+        /// SaveWhitelistToDiskAsync: random temp name, FileMode.CreateNew,
+        /// atomic Move.
+        /// </summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task SaveRuntimeOverridesAsync()
+        {
+            await _runtimeOverridesFileLock.WaitAsync();
+            try
+            {
+                string? dir = Path.GetDirectoryName(_runtimeOverridesFilePath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+
+                    try
+                    {
+                        SecureDirectoryToAdminsAndSystem(dir);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir);
+                    }
+
+                    if (!IsAdminOnlyLocation(dir, isDirectory: true))
+                    {
+                        _logger.LogCritical("Not persisting runtime overrides: {dir} is not exclusively controlled by Administrators/SYSTEM.", dir);
+                        return;
+                    }
+                }
+
+                var overrides = new RuntimeOverrides { GlobalMaxTcpConnections = _globalMaxTcpConnections };
+                string tempPath = _runtimeOverridesFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(overrides));
+                try
+                {
+                    await using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        bufferSize: 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+                    {
+                        await fs.WriteAsync(payload);
+                        await fs.FlushAsync();
+                    }
+                    File.Move(tempPath, _runtimeOverridesFilePath, overwrite: true);
+                    _logger.LogInformation("Saved runtime overrides to {path} (GlobalMaxTcpConnections={val}).", _runtimeOverridesFilePath, _globalMaxTcpConnections);
+                }
+                catch
+                {
+                    try { File.Delete(tempPath); } catch { }
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist runtime overrides to disk.");
+            }
+            finally
+            {
+                _runtimeOverridesFileLock.Release();
             }
         }
 
@@ -1096,6 +1564,27 @@ namespace NetworkWatchdogService
                 string? scmServiceName = IsValidServiceName(actualServiceName) ? actualServiceName : null;
                 string serviceNameToUse = scmServiceName ?? fallbackServiceName;
 
+                // Discover, by file lock (not by name), any OTHER process holding
+                // the target's own executable open - this is what "a related
+                // process blocks the restart" actually means at the OS level, and
+                // it works for any leaking process, not just ones named in config.
+                // Deliberately queried BEFORE the target is killed, while its exe
+                // path is still readable from the live process.
+                string? exePath = null;
+                try { exePath = proc?.MainModule?.FileName; }
+                catch (Exception ex) { _logger.LogInformation(ex, "Could not read MainModule.FileName for PID {pid}; skipping dependent-process discovery.", processId); }
+
+                var blockingPids = !string.IsNullOrEmpty(exePath)
+                    ? GetProcessesLockingFile(exePath, processId)
+                    : new List<int>();
+
+                if (blockingPids.Count > 0)
+                {
+                    _logger.LogWarning("Restart Manager reports {count} other process(es) locking {path}; these will be terminated alongside PID {pid} so the restart isn't blocked.",
+                        blockingPids.Count, exePath, processId);
+                    SendSyslog(SyslogSeverity.Notice, $"Terminating {blockingPids.Count} dependent process(es) blocking restart of PID {processId} ({exePath}).");
+                }
+
                 _logger.LogWarning("Force killing leaking process/service {serviceName} (PID {pid})...", serviceNameToUse, processId);
 
                 if (scmServiceName != null)
@@ -1111,6 +1600,39 @@ namespace NetworkWatchdogService
                 }
                 ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", processId.ToString() });
                 proc?.Dispose();
+
+                // Terminate each discovered blocking process too, with the same
+                // whitelist respect as the primary target. Each gets its own
+                // fresh Process.GetProcessById lookup immediately before acting,
+                // so one that already exited between discovery and now is simply
+                // skipped rather than acted on blind.
+                foreach (int blockingPid in blockingPids)
+                {
+                    try
+                    {
+                        using var blockingProc = Process.GetProcessById(blockingPid);
+                        string blockingName = blockingProc.ProcessName;
+                        string blockingClean = Path.GetFileNameWithoutExtension(blockingName);
+
+                        if (_whitelist.ContainsKey(blockingClean) || _whitelist.ContainsKey(blockingName))
+                        {
+                            _logger.LogInformation("Not terminating blocking process {name} (PID {pid}): whitelisted.", blockingName, blockingPid);
+                            continue;
+                        }
+
+                        _logger.LogWarning("Terminating {name} (PID {pid}): blocking restart of {target} (PID {targetPid}).",
+                            blockingName, blockingPid, serviceNameToUse, processId);
+                        ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", blockingPid.ToString() });
+                    }
+                    catch (ArgumentException)
+                    {
+                        // Already exited between discovery and now - nothing to do.
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to terminate blocking PID {pid}.", blockingPid);
+                    }
+                }
 
                 _recentRestarts.Enqueue($"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss},{serviceNameToUse},{processId},Exceeded {socketCount} sockets");
                 while (_recentRestarts.Count > 50 && _recentRestarts.TryDequeue(out _)) { }
@@ -1140,6 +1662,84 @@ namespace NetworkWatchdogService
             {
                 _activeRestarts.TryRemove(processId, out _);
             }
+        }
+
+        /// <summary>
+        /// Returns the PIDs of other processes holding a lock on the given file,
+        /// via Windows Restart Manager - the same mechanism installers/updaters
+        /// use to determine what needs to close before a file can be replaced.
+        /// Returns an empty list (never null) on any failure, logging a warning
+        /// rather than throwing, so a Restart Manager problem degrades to "just
+        /// restart the primary target" instead of blocking the restart entirely.
+        /// </summary>
+        private List<int> GetProcessesLockingFile(string filePath, int excludePid)
+        {
+            var result = new List<int>();
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return result;
+
+            const int ERROR_MORE_DATA = 234;
+            uint handle = 0;
+            bool sessionStarted = false;
+
+            try
+            {
+                var sessionKey = new StringBuilder(CCH_RM_SESSION_KEY + 1);
+                int res = RmStartSession(out handle, 0, sessionKey);
+                if (res != 0)
+                {
+                    _logger.LogWarning("RmStartSession failed with code {code}; skipping dependent-process discovery for {path}.", res, filePath);
+                    return result;
+                }
+                sessionStarted = true;
+
+                res = RmRegisterResources(handle, 1, new[] { filePath }, 0, null, 0, null);
+                if (res != 0)
+                {
+                    _logger.LogWarning("RmRegisterResources failed with code {code} for {path}; skipping dependent-process discovery.", res, filePath);
+                    return result;
+                }
+
+                uint pnProcInfoNeeded = 0;
+                uint pnProcInfo = 0;
+                uint lpdwRebootReasons = 0;
+
+                // Sizing call: null array, just asks how many entries exist.
+                res = RmGetList(handle, out pnProcInfoNeeded, ref pnProcInfo, null, ref lpdwRebootReasons);
+                if (res != 0 && res != ERROR_MORE_DATA)
+                {
+                    _logger.LogWarning("RmGetList (sizing call) failed with code {code} for {path}; skipping dependent-process discovery.", res, filePath);
+                    return result;
+                }
+                if (pnProcInfoNeeded == 0) return result;
+
+                var processInfo = new RM_PROCESS_INFO[pnProcInfoNeeded];
+                pnProcInfo = pnProcInfoNeeded;
+                res = RmGetList(handle, out pnProcInfoNeeded, ref pnProcInfo, processInfo, ref lpdwRebootReasons);
+                if (res != 0)
+                {
+                    _logger.LogWarning("RmGetList failed with code {code} for {path}; skipping dependent-process discovery.", res, filePath);
+                    return result;
+                }
+
+                for (int i = 0; i < pnProcInfo; i++)
+                {
+                    int pid = processInfo[i].Process.dwProcessId;
+                    if (pid != excludePid && pid > 4) result.Add(pid);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Restart Manager query failed unexpectedly for {path}; continuing without dependent-process discovery.", filePath);
+            }
+            finally
+            {
+                if (sessionStarted)
+                {
+                    try { RmEndSession(handle); } catch { /* best effort */ }
+                }
+            }
+
+            return result;
         }
 
         private static bool IsValidServiceName([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] string? name)
@@ -1303,28 +1903,4 @@ namespace NetworkWatchdogService
         }
     }
 
-    public class TelemetryPacket
-    {
-        public string Timestamp { get; set; } = string.Empty;
-        public int GlobalMaxTcpConnections { get; set; }
-        public List<string> Whitelist { get; set; } = new();
-        public List<ProcessTelemetryItem> Processes { get; set; } = new();
-        public List<string> RecentRestarts { get; set; } = new();
-        public string BuildMarker { get; set; } = string.Empty;
-    }
-
-    public class ProcessTelemetryItem
-    {
-        public string ServiceName { get; set; } = string.Empty;
-        public int Pid { get; set; }
-        public int Connections { get; set; }
-        public string Status { get; set; } = string.Empty;
-    }
-
-    public class ConfigUpdateCommand
-    {
-        public int? NewGlobalThreshold { get; set; }
-        public string? AddWhitelist { get; set; }
-        public string? RemoveWhitelist { get; set; }
-    }
 }

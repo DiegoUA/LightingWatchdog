@@ -4,6 +4,35 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.7.0] - 2026-10-06
+
+### Added
+
+- **Native Restart Manager Integration**: Implemented Windows Restart Manager (`rstrtmgr.dll`) interop to universally detect and terminate any dependent processes holding a file lock on a mitigated executable. This guarantees clean SCM restarts without relying on hardcoded child process names.
+- **Quarantine & Cooldown Lifecycle**: Introduced rolling-window Quarantine (suspends auto-restarts after 3 attempts in 60 minutes) and Cooldown (120-second short-term throttling). This prevents restart-storming and protects system stability during terminal leak scenarios.
+- **Dynamic Feature Flags**: Added per-service `EnableRestart` toggles (detect-and-alert mode) and a global `MonitorAllProcesses` flag to precisely restrict Watchdog tracking scope.
+- **Remote Syslog Integration**: Added automated UDP syslog forwarding (RFC 3164) for centralized network telemetry, capturing critical events like process mitigation, quarantine activation, and severe resync failures.
+
+### Changed
+
+- **IConfiguration & AppSettings Integration**: Fully wired `appsettings.json` into the Worker via `IOptions<WatchdogConfig>`. The service now natively obeys `WatchdogIntervalSeconds` (15s default), `GlobalMaxTcpConnections` (1000 default), and per-service threshold overrides, completely resolving previous configuration technical debt.
+- **Process Whitelist Seeding**: Merged the static `ProcessWhitelist` config array seamlessly into the persistent, ACL-locked runtime whitelist on startup.
+- **Working Directory Context**: Bound the executable's `CurrentDirectory` to `AppDomain.CurrentDomain.BaseDirectory` in `Program.cs` to ensure the Service Control Manager reads `appsettings.json` locally instead of targeting `System32`.
+
+### Fixed
+
+- **Persistent Configuration State**: Fixed a bug where clicking "Save Configuration" in the Tray App failed to persist the threshold. The service now securely saves user overrides to `runtime-overrides.json` using the same atomic-write and Administrator-only ACL lock-downs as the whitelist.
+
+## [3.6.1] - 2026-10-03
+
+### Added
+
+- **Decoupled Telemetry Display Filter:** Introduced a dedicated `TelemetryDisplayThreshold = 30` filter inside the IPC packet builder. This hides idle, low-connection processes (≤ 30 sockets) from the Tray App dashboard to declutter the UI, without excluding them from the core mitigation engine. The background service continues to evaluate every active PID system-wide against the global threshold.
+
+### Changed
+
+- **Configuration Precedence (Technical Debt):** The application temporarily bypasses `appsettings.json` per-service limits, `MonitorAllProcesses` flags, and process tree targets. All system-wide socket tracking currently relies exclusively on the hardcoded `1000` socket limit and the `15s` polling interval, with user-driven runtime overrides persisting securely to `state.json`.
+
 ## [3.6.0] - 2026-10-02
 
 ### Added
