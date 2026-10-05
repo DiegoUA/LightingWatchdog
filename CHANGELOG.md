@@ -4,6 +4,16 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.7.2] - 2026-10-06
+
+### Added
+
+- **Historical Mitigation Archive**: Split Dashboard mitigation logs into "Session Logs" (in-memory for the active TrayApp session) and "Historical Archive" (persistent cross-reboot records loaded directly from `%ProgramData%\NetworkWatchdogService\MitigationHistory.csv`).
+
+### Fixed
+
+- **Infinite Auto-Updater Loop**: Replaced the static hardcoded version string in `GitHubAutoUpdater` with dynamic execution assembly inspection (`Assembly.GetExecutingAssembly().GetName().Version`). Replaced brittle string alphabetical comparisons with robust `System.Version` semantic parsing to eliminate endless recursive update prompts.
+
 ## [3.7.1] - 2026-10-06
 
 ### Fixed

@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -66,13 +67,12 @@ namespace NetworkWatchdog.TrayApp
             _timer.Start();
 
             _updateTimer = new System.Windows.Forms.Timer { Interval = 86400000 };
-            _updateTimer.Tick += async (s, e) => 
+            _updateTimer.Tick += async (s, e) =>
             {
                 try { await GitHubAutoUpdater.CheckForUpdatesAsync(); } catch { }
             };
             _updateTimer.Start();
 
-            // Safe startup check delay without raw thread invocations
             _ = Task.Run(async () =>
             {
                 await Task.Delay(5000);
@@ -90,7 +90,7 @@ namespace NetworkWatchdog.TrayApp
             IntPtr hIcon = bitmap.GetHicon();
             using var tempIcon = Icon.FromHandle(hIcon);
             var finalIcon = (Icon)tempIcon.Clone();
-            DestroyIcon(hIcon); 
+            DestroyIcon(hIcon);
             return finalIcon;
         }
 
@@ -136,7 +136,6 @@ namespace NetworkWatchdog.TrayApp
 
             if (oldMenu != null)
             {
-                // Delay disposal to ensure message pump finishes processing current context menu operations safely
                 Task.Delay(500).ContinueWith(_ => oldMenu.Dispose());
             }
         }
@@ -277,8 +276,12 @@ namespace NetworkWatchdog.TrayApp
     public static class GitHubAutoUpdater
     {
         private const string RepoOwner = "DiegoUA";
-        private const string RepoName = "LightingWatchdog"; 
-        private const string CurrentVersion = "v3.7.0"; 
+        private const string RepoName = "LightingWatchdog";
+
+        public static Version GetCurrentVersion()
+        {
+            return Assembly.GetExecutingAssembly().GetName().Version ?? new Version(3, 7, 2, 0);
+        }
 
         public static async Task CheckForUpdatesAsync(bool manualCheck = false)
         {
@@ -292,39 +295,51 @@ namespace NetworkWatchdog.TrayApp
                 
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
-                string latestVersion = root.GetProperty("tag_name").GetString() ?? "";
-                
-                if (string.Compare(latestVersion, CurrentVersion, StringComparison.OrdinalIgnoreCase) > 0)
+                string latestTag = root.GetProperty("tag_name").GetString() ?? "";
+
+                string cleanTag = latestTag.TrimStart('v', 'V');
+                if (Version.TryParse(cleanTag, out var remoteVersion))
                 {
-                    string downloadUrl = "";
-                    foreach (var asset in root.GetProperty("assets").EnumerateArray())
+                    var localVersion = GetCurrentVersion();
+                    var normalizedRemote = new Version(remoteVersion.Major, remoteVersion.Minor, Math.Max(0, remoteVersion.Build));
+                    var normalizedLocal = new Version(localVersion.Major, localVersion.Minor, Math.Max(0, localVersion.Build));
+
+                    if (normalizedRemote > normalizedLocal)
                     {
-                        string name = asset.GetProperty("name").GetString() ?? "";
-                        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        string downloadUrl = "";
+                        foreach (var asset in root.GetProperty("assets").EnumerateArray())
                         {
-                            downloadUrl = asset.GetProperty("browser_download_url").GetString() ?? "";
-                            break;
+                            string name = asset.GetProperty("name").GetString() ?? "";
+                            if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                            {
+                                downloadUrl = asset.GetProperty("browser_download_url").GetString() ?? "";
+                                break;
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(downloadUrl))
+                        {
+                            var result = MessageBox.Show(
+                                $"A new version of NetworkWatchdog ({latestTag}) is available on GitHub.\n\n" +
+                                $"Would you like to download and install it now? This will briefly restart the background service.", 
+                                "NetworkWatchdog Update Available", 
+                                MessageBoxButtons.YesNo, 
+                                MessageBoxIcon.Information);
+                                
+                            if (result == DialogResult.Yes)
+                            {
+                                await DownloadAndInstallAsync(client, downloadUrl);
+                            }
                         }
                     }
-
-                    if (!string.IsNullOrEmpty(downloadUrl))
+                    else if (manualCheck)
                     {
-                        var result = MessageBox.Show(
-                            $"A new version of NetworkWatchdog ({latestVersion}) is available on GitHub.\n\n" +
-                            $"Would you like to download and install it now? This will briefly restart the background service.", 
-                            "NetworkWatchdog Update Available", 
-                            MessageBoxButtons.YesNo, 
-                            MessageBoxIcon.Information);
-                            
-                        if (result == DialogResult.Yes)
-                        {
-                            await DownloadAndInstallAsync(client, downloadUrl);
-                        }
+                        MessageBox.Show($"You are running the latest version of NetworkWatchdog ({localVersion.Major}.{localVersion.Minor}.{Math.Max(0, localVersion.Build)}).", "Up to Date", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                 }
                 else if (manualCheck)
                 {
-                    MessageBox.Show("You are running the latest version of NetworkWatchdog.", "Up to Date", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show($"Could not parse release tag format: {latestTag}", "Version Parse Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
             catch (Exception ex)
@@ -368,10 +383,15 @@ namespace NetworkWatchdog.TrayApp
         private readonly Func<ConfigUpdateCommand, bool> _sendConfigAction;
         private readonly TabControl _tabs;
         private readonly DataGridView _gridProcesses;
-        private readonly DataGridView _gridRestarts;
+        private readonly DataGridView _gridRestartsSession;
+        private readonly DataGridView _gridRestartsHistorical;
         private readonly ListBox _listWhitelist;
         private readonly TrackBar _sliderThreshold;
         private readonly NumericUpDown _numThreshold;
+
+        private readonly string _historyCsvPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "NetworkWatchdogService", "MitigationHistory.csv");
 
         public DashboardForm(Action<int, string> killAction, Func<ConfigUpdateCommand, bool> sendConfigAction)
         {
@@ -379,7 +399,7 @@ namespace NetworkWatchdog.TrayApp
             _sendConfigAction = sendConfigAction;
 
             Text = "NetworkWatchdog Telemetry & Control Dashboard";
-            Size = new Size(760, 520);
+            Size = new Size(800, 540);
             StartPosition = FormStartPosition.CenterScreen;
 
             _tabs = new TabControl { Dock = DockStyle.Fill };
@@ -407,13 +427,28 @@ namespace NetworkWatchdog.TrayApp
             tabProcesses.Controls.Add(_gridProcesses);
             tabProcesses.Controls.Add(btnPanel);
 
-            var tabRestarts = new TabPage("Mitigation Logs");
-            _gridRestarts = new DataGridView { Dock = DockStyle.Fill, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, ReadOnly = true };
-            _gridRestarts.Columns.Add("Timestamp", "Timestamp");
-            _gridRestarts.Columns.Add("ServiceName", "Process");
-            _gridRestarts.Columns.Add("Pid", "PID");
-            _gridRestarts.Columns.Add("Reason", "Reason");
-            tabRestarts.Controls.Add(_gridRestarts);
+            var tabRestartsSession = new TabPage("Session Logs");
+            _gridRestartsSession = new DataGridView { Dock = DockStyle.Fill, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, ReadOnly = true };
+            _gridRestartsSession.Columns.Add("Timestamp", "Timestamp");
+            _gridRestartsSession.Columns.Add("ServiceName", "Process");
+            _gridRestartsSession.Columns.Add("Pid", "PID");
+            _gridRestartsSession.Columns.Add("Reason", "Reason");
+            tabRestartsSession.Controls.Add(_gridRestartsSession);
+
+            var tabRestartsHistorical = new TabPage("Historical Archive");
+            _gridRestartsHistorical = new DataGridView { Dock = DockStyle.Fill, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, ReadOnly = true };
+            _gridRestartsHistorical.Columns.Add("Timestamp", "Timestamp");
+            _gridRestartsHistorical.Columns.Add("ServiceName", "Process");
+            _gridRestartsHistorical.Columns.Add("Pid", "PID");
+            _gridRestartsHistorical.Columns.Add("Reason", "Reason");
+
+            var pnlHistoricalControls = new Panel { Dock = DockStyle.Bottom, Height = 45 };
+            var btnRefreshHist = new Button { Text = "Reload Historical Log", Width = 180, Height = 32, Top = 6, Left = 10 };
+            btnRefreshHist.Click += (s, e) => LoadHistoricalLog();
+            pnlHistoricalControls.Controls.Add(btnRefreshHist);
+
+            tabRestartsHistorical.Controls.Add(_gridRestartsHistorical);
+            tabRestartsHistorical.Controls.Add(pnlHistoricalControls);
 
             var tabSettings = new TabPage("Settings & Whitelist");
             var pnlSettings = new Panel { Dock = DockStyle.Fill, Padding = new Padding(15) };
@@ -479,8 +514,38 @@ namespace NetworkWatchdog.TrayApp
             pnlSettings.Controls.AddRange(new Control[] { lblThresh, _sliderThreshold, _numThreshold, btnSaveConfig, lblWhite, _listWhitelist, txtNewItem, btnAdd, btnRemove });
             tabSettings.Controls.Add(pnlSettings);
 
-            _tabs.TabPages.AddRange(new[] { tabProcesses, tabRestarts, tabSettings });
+            _tabs.TabPages.AddRange(new[] { tabProcesses, tabRestartsSession, tabRestartsHistorical, tabSettings });
             Controls.Add(_tabs);
+
+            LoadHistoricalLog();
+        }
+
+        private void LoadHistoricalLog()
+        {
+            try
+            {
+                if (!File.Exists(_historyCsvPath)) return;
+
+                int histScroll = _gridRestartsHistorical.FirstDisplayedScrollingRowIndex;
+                _gridRestartsHistorical.Rows.Clear();
+
+                var lines = File.ReadAllLines(_historyCsvPath);
+                foreach (var line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var parts = line.Split(',');
+                    if (parts.Length >= 4)
+                    {
+                        _gridRestartsHistorical.Rows.Add(parts[0], parts[1], parts[2], parts[3]);
+                    }
+                }
+
+                if (histScroll >= 0 && _gridRestartsHistorical.Rows.Count > 0)
+                {
+                    _gridRestartsHistorical.FirstDisplayedScrollingRowIndex = Math.Min(histScroll, _gridRestartsHistorical.Rows.Count - 1);
+                }
+            }
+            catch { }
         }
 
         public void RefreshData(TelemetryPacket packet)
@@ -503,20 +568,20 @@ namespace NetworkWatchdog.TrayApp
                 _gridProcesses.FirstDisplayedScrollingRowIndex = Math.Min(procScroll, _gridProcesses.Rows.Count - 1);
             }
 
-            int restScroll = _gridRestarts.FirstDisplayedScrollingRowIndex;
-            _gridRestarts.Rows.Clear();
+            int restScroll = _gridRestartsSession.FirstDisplayedScrollingRowIndex;
+            _gridRestartsSession.Rows.Clear();
             foreach (var log in packet.RecentRestarts)
             {
                 var parts = log.Split(',');
                 if (parts.Length >= 4)
                 {
-                    _gridRestarts.Rows.Add(parts[0], parts[1], parts[2], parts[3]);
+                    _gridRestartsSession.Rows.Add(parts[0], parts[1], parts[2], parts[3]);
                 }
             }
 
-            if (restScroll >= 0 && _gridRestarts.Rows.Count > 0)
+            if (restScroll >= 0 && _gridRestartsSession.Rows.Count > 0)
             {
-                _gridRestarts.FirstDisplayedScrollingRowIndex = Math.Min(restScroll, _gridRestarts.Rows.Count - 1);
+                _gridRestartsSession.FirstDisplayedScrollingRowIndex = Math.Min(restScroll, _gridRestartsSession.Rows.Count - 1);
             }
 
             if (_sliderThreshold.Value != packet.GlobalMaxTcpConnections && packet.GlobalMaxTcpConnections >= _sliderThreshold.Minimum && packet.GlobalMaxTcpConnections <= _sliderThreshold.Maximum)
