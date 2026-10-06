@@ -149,6 +149,32 @@ namespace NetworkWatchdogService
         // is unaffected: every tracked PID is still checked against its
         // resolved threshold regardless of this value.
         private const int TelemetryDisplayThreshold = 30;
+
+        // Status banding relative to the process's OWN restart threshold. Keep in sync with
+        // HealthBands in the TrayApp (AmberStartFraction / RedStartFraction). Previously
+        // "Healthy" was a hardcoded < 500 and "CRITICAL" only at >= the threshold - which a
+        // process restarted at threshold+1 could essentially never display.
+        private const double StatusAmberFraction = 0.50;
+        private const double StatusRedFraction = 0.80;
+
+        // Persistent mitigation archive. Lives in the same ACL-locked directory as
+        // whitelist.json / runtime-overrides.json, so the unprivileged TrayApp cannot read it
+        // directly - it asks for it over the telemetry pipe (GET_HISTORY) instead.
+        private readonly string _mitigationHistoryFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "NetworkWatchdogService", "MitigationHistory.csv");
+        private readonly SemaphoreSlim _mitigationHistoryLock = new(1, 1);
+
+        // Pre-mitigation R&D evidence (see EvidenceCollector.cs). Cases live in the same
+        // Administrators/SYSTEM-only %ProgramData%\NetworkWatchdogService tree.
+        private readonly string _evidenceDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "NetworkWatchdogService", "Evidence");
+        private readonly SemaphoreSlim _evidenceLock = new(1, 1);          // one capture at a time
+        private readonly ConcurrentDictionary<string, DateTime> _lastAutoEvidence = new(StringComparer.OrdinalIgnoreCase);
+        private volatile bool _captureEvidenceBeforeMitigation;
+        private const long MaxMitigationHistoryBytes = 5L * 1024 * 1024;
+        private const int MaxHistoryEntriesServed = 1000;
         private readonly object _connectionCountsLock = new();
 
         private readonly record struct AfdEvent(int ProcessId, bool IsConnect);
@@ -157,7 +183,7 @@ namespace NetworkWatchdogService
         // exposed in telemetry, so you can tell at a glance - from the
         // service's own log or the dashboard itself - whether the process
         // that's actually running matches the source you just built.
-        private const string BuildMarker = "2026-10-03-config1";
+        private const string BuildMarker = "2026-10-09-v3.9.0-evidence";
 
         private readonly WatchdogConfig _config;
 
@@ -167,13 +193,17 @@ namespace NetworkWatchdogService
         // overrides and the EnableRestart toggle.
         private readonly Dictionary<string, MonitoredService> _serviceConfigByProcessName;
 
-        // Cheap pre-filter for the 5-second detection loop: the lowest threshold
-        // any process could possibly be held to (global or any per-service
-        // override, whichever is smaller). A PID below this can never breach
-        // any applicable threshold, so its name/config never needs resolving -
-        // this keeps the hot path cheap even with MonitorAllProcesses=true and
-        // CIM reporting counts for every process on the box.
-        private readonly int _minPossibleThreshold;
+        // Cheap pre-filter for the 5-second detection loop: the lowest threshold any process
+        // could possibly be held to. A PID below it can never breach any applicable threshold,
+        // so its name/config never needs resolving - this keeps the hot path cheap even with
+        // MonitorAllProcesses=true and CIM reporting counts for every process on the box.
+        //
+        // Only the PINNED per-service minimum is fixed at startup. The global threshold changes at
+        // runtime (dashboard slider, saved override), so the floor is recomputed on every pass.
+        // (Before v3.9.0 the whole floor was frozen at startup, so a threshold lowered below the
+        // startup value - by the slider or by a saved override - never triggered a restart.)
+        private readonly int _lowestPinnedServiceThreshold;
+        private int MinPossibleThreshold => Math.Min(_globalMaxTcpConnections, _lowestPinnedServiceThreshold);
 
         // Cooldown: minimum time between restart *attempts* of the same service
         // name (not PID - PIDs change every restart). Keyed by the clean process
@@ -190,6 +220,7 @@ namespace NetworkWatchdogService
             _logger = logger;
             _config = options.Value ?? new WatchdogConfig();
             _globalMaxTcpConnections = _config.GlobalMaxTcpConnections;
+            _captureEvidenceBeforeMitigation = _config.Evidence.Enabled && _config.Evidence.CaptureBeforeMitigation;
 
             _serviceConfigByProcessName = new Dictionary<string, MonitoredService>(StringComparer.OrdinalIgnoreCase);
             foreach (var svc in _config.MonitoredServices)
@@ -201,9 +232,11 @@ namespace NetworkWatchdogService
                         _serviceConfigByProcessName[name] = svc;
             }
 
-            _minPossibleThreshold = _config.MonitoredServices.Count > 0
-                ? Math.Min(_config.GlobalMaxTcpConnections, _config.MonitoredServices.Min(s => s.MaxTcpConnections))
-                : _config.GlobalMaxTcpConnections;
+            _lowestPinnedServiceThreshold = _config.MonitoredServices
+                .Where(s => s.MaxTcpConnections.HasValue)
+                .Select(s => s.MaxTcpConnections!.Value)
+                .DefaultIfEmpty(int.MaxValue)
+                .Min();
         }
 
         /// <summary>
@@ -215,7 +248,8 @@ namespace NetworkWatchdogService
         private (int Threshold, bool RestartEnabled, string? ServiceGroupName) ResolveThresholdForProcess(string cleanName)
         {
             if (_serviceConfigByProcessName.TryGetValue(cleanName, out var svc))
-                return (svc.MaxTcpConnections, svc.EnableRestart, svc.ServiceName);
+                // A service entry without MaxTcpConnections inherits the live global threshold (the dashboard slider).
+                return (svc.MaxTcpConnections ?? _globalMaxTcpConnections, svc.EnableRestart, svc.ServiceName);
             return (_globalMaxTcpConnections, true, null);
         }
 
@@ -227,86 +261,42 @@ namespace NetworkWatchdogService
             return name;
         }
 
-        // --- Syslog (RFC 3164, UDP) ---
-        //
-        // WatchdogConfig.Syslog existed as a data holder with nothing reading it;
-        // this is that missing consumer. Deliberately UDP and fire-and-forget: a
-        // syslog server being down or unreachable must never block or throw from
-        // detection/restart logic, so every failure path here only logs locally
-        // and continues. Deliberately NOT a mirror of every log line - only the
-        // handful of events below that represent a meaningful state change
-        // someone monitoring centrally would actually want to see, to avoid
-        // turning this into log spam at your real connection-count volumes.
-        private UdpClient? _syslogClient;
-        private readonly object _syslogInitLock = new();
-
-        private enum SyslogSeverity { Emergency = 0, Alert = 1, Critical = 2, Error = 3, Warning = 4, Notice = 5, Informational = 6, Debug = 7 }
-
-        private void EnsureSyslogClient()
-        {
-            if (!_config.Syslog.Enabled || _syslogClient != null) return;
-
-            lock (_syslogInitLock)
-            {
-                if (_syslogClient != null) return;
-                try
-                {
-                    var client = new UdpClient();
-                    client.Connect(_config.Syslog.ServerIp, _config.Syslog.Port);
-                    _syslogClient = client;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to initialize syslog UDP client for {ip}:{port}; syslog forwarding disabled for this session.",
-                        _config.Syslog.ServerIp, _config.Syslog.Port);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Sends one RFC 3164 formatted line via UDP to the configured syslog
-        /// server. Facility is fixed at local0 (16), which is conventional for
-        /// an application-specific daemon with no more specific facility of its
-        /// own. No-op (and cheap) when Syslog.Enabled is false.
-        /// </summary>
+        // --- Syslog ---
+        // The single RFC 3164/UDP implementation lives in SyslogNotifier.cs (it used to be
+        // duplicated inline here while SyslogNotifier.cs sat unused). Fire-and-forget: a syslog
+        // failure never affects detection or restarts. Only meaningful state changes are sent.
         private void SendSyslog(SyslogSeverity severity, string message)
+            => SyslogNotifier.Send(_config.Syslog, severity, message);
+
+        // Rate limiter for repeated notices (log + syslog), e.g. a process that keeps breaching
+        // its threshold every 5 s while it sits in cooldown or quarantine.
+        private readonly ConcurrentDictionary<string, DateTime> _lastNotice = new();
+
+        private bool ShouldNotify(string key, TimeSpan interval)
         {
-            if (!_config.Syslog.Enabled) return;
-            EnsureSyslogClient();
-            if (_syslogClient == null) return;
-
-            try
+            DateTime now = DateTime.UtcNow;
+            while (true)
             {
-                const int facility = 16; // local0
-                int priority = facility * 8 + (int)severity;
-
-                // RFC 3164 wants the day-of-month space-padded (not zero-padded)
-                // to two characters, e.g. "Oct  4" not "Oct 04".
-                string timestamp = DateTime.Now.ToString("MMM dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
-                if (timestamp.Length > 4 && timestamp[4] == '0')
+                if (!_lastNotice.TryGetValue(key, out DateTime last))
                 {
-                    var chars = timestamp.ToCharArray();
-                    chars[4] = ' ';
-                    timestamp = new string(chars);
+                    if (_lastNotice.TryAdd(key, now)) return true;
+                    continue;
                 }
-
-                string line = $"<{priority}>{timestamp} {Environment.MachineName} NetworkWatchdogService: {message}";
-                byte[] bytes = Encoding.ASCII.GetBytes(line);
-                _syslogClient.Send(bytes, bytes.Length);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to send syslog message.");
+                if (now - last < interval) return false;
+                if (_lastNotice.TryUpdate(key, now, last)) return true;
             }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogCritical("Starting NetworkWatchdogService Worker. BuildMarker={marker}", BuildMarker);
+            _logger.LogInformation("Starting NetworkWatchdogService Worker. BuildMarker={marker}", BuildMarker);
             SendSyslog(SyslogSeverity.Informational, $"NetworkWatchdogService starting (BuildMarker={BuildMarker}).");
 
             LoadWhitelistFromDisk();
             LoadRuntimeOverrides();
+
+            string? dataDir = EnsureSecureDataDirectory();
+            if (dataDir != null) TelemetryExporter.Initialize(dataDir);
             SafeResyncGlobalBaseline("startup");
 
             _ = Task.Run(() => ProcessEtwChannelAsync(stoppingToken), stoppingToken);
@@ -326,7 +316,7 @@ namespace NetworkWatchdogService
 
                     // Cheap pre-filter: below the lowest threshold any process could
                     // possibly be held to, so there is nothing to resolve or check.
-                    if (currentConnections <= _minPossibleThreshold) continue;
+                    if (currentConnections <= MinPossibleThreshold) continue;
 
                     try
                     {
@@ -372,9 +362,12 @@ namespace NetworkWatchdogService
                         // cooldown/quarantine apply per logical service, not per PID.
                         string bookkeepingName = serviceGroupName ?? cleanName;
 
-                        _logger.LogCritical("CRITICAL: Socket leak breach ({count} > {max}) in PID {pid} ({name})!",
-                            currentConnections, threshold, proc.Id, bookkeepingName);
-                        SendSyslog(SyslogSeverity.Warning, $"Socket leak breach: {bookkeepingName} (PID {proc.Id}) has {currentConnections} connections, threshold {threshold}.");
+                        if (ShouldNotify("breach:" + bookkeepingName, TimeSpan.FromSeconds(60)))
+                        {
+                            _logger.LogWarning("Socket leak breach ({count} > {max}) in PID {pid} ({name})!",
+                                currentConnections, threshold, proc.Id, bookkeepingName);
+                            SendSyslog(SyslogSeverity.Warning, $"Socket leak breach: {bookkeepingName} (PID {proc.Id}) has {currentConnections} connections, threshold {threshold}.");
+                        }
 
                         if (!restartEnabled)
                         {
@@ -387,17 +380,21 @@ namespace NetworkWatchdogService
                             // Not sent to syslog: this can repeat every 5s while a
                             // service sits in cooldown, which would spam a central
                             // log server with no new information each time.
-                            _logger.LogInformation("{name} breached its threshold again but is still in cooldown for {remaining}s; not restarting yet.",
-                                bookkeepingName, (int)remaining.TotalSeconds);
+                            if (ShouldNotify("cooldown:" + bookkeepingName, TimeSpan.FromSeconds(60)))
+                                _logger.LogInformation("{name} breached its threshold again but is still in cooldown for {remaining}s; not restarting yet.",
+                                    bookkeepingName, (int)remaining.TotalSeconds);
                             continue;
                         }
 
                         if (_config.EnableQuarantine && IsQuarantined(bookkeepingName, out int recentCount))
                         {
-                            _logger.LogCritical("QUARANTINED: {name} has restarted {count} times in the last {window} minute(s) (limit {limit}). " +
-                                "Not auto-restarting - this needs manual investigation.",
-                                bookkeepingName, recentCount, _config.QuarantineWindowMinutes, _config.QuarantineRestartLimit);
-                            SendSyslog(SyslogSeverity.Alert, $"QUARANTINED: {bookkeepingName} restarted {recentCount} times in the last {_config.QuarantineWindowMinutes} minute(s); auto-restart suspended, manual investigation needed.");
+                            if (ShouldNotify("quarantine:" + bookkeepingName, TimeSpan.FromMinutes(10)))
+                            {
+                                _logger.LogCritical("QUARANTINED: {name} has restarted {count} times in the last {window} minute(s) (limit {limit}). " +
+                                    "Not auto-restarting - this needs manual investigation.",
+                                    bookkeepingName, recentCount, _config.QuarantineWindowMinutes, _config.QuarantineRestartLimit);
+                                SendSyslog(SyslogSeverity.Alert, $"QUARANTINED: {bookkeepingName} restarted {recentCount} times in the last {_config.QuarantineWindowMinutes} minute(s); auto-restart suspended, manual investigation needed.");
+                            }
                             continue;
                         }
 
@@ -405,10 +402,12 @@ namespace NetworkWatchdogService
                         _activeRestarts.TryAdd(pid, DateTime.UtcNow);
                         SendSyslog(SyslogSeverity.Notice, $"Restarting {bookkeepingName} (PID {proc.Id}) due to socket leak ({currentConnections} connections).");
 
-                        _ = RestartLeakingServiceAsync(procName, proc.Id, currentConnections, currentStartTime);
+                        _ = RestartLeakingServiceAsync(procName, proc.Id, currentConnections, currentStartTime, threshold);
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
+                        // Typically the process exited between the count update and this check.
+                        _logger.LogDebug(ex, "Detection check for PID {pid} failed; dropping its tracking state.", pid);
                         _pidConnectionCounts.TryRemove(pid, out _);
                         _pidStartTimes.TryRemove(pid, out _);
                         _processNameCache.TryRemove(pid, out _);
@@ -578,7 +577,7 @@ namespace NetworkWatchdogService
                     }
                 }
 
-                _logger.LogCritical("GetExtendedTcpTable (IPv{ver}) kept returning ERROR_INSUFFICIENT_BUFFER after {attempts} attempts; skipping this cycle.", ipVersion == AF_INET ? 4 : 6, MaxAttempts);
+                _logger.LogWarning("GetExtendedTcpTable (IPv{ver}) kept returning ERROR_INSUFFICIENT_BUFFER after {attempts} attempts; skipping this cycle.", ipVersion == AF_INET ? 4 : 6, MaxAttempts);
             }
 
             Fetch(AF_INET, 24, 20);
@@ -619,7 +618,7 @@ namespace NetworkWatchdogService
             }
             catch (Exception ex)
             {
-                _logger.LogCritical(ex, "CIM/NSI query for MSFT_NetTCPConnection failed.");
+                if (ShouldNotify("cim-failed", TimeSpan.FromMinutes(5))) _logger.LogError(ex, "CIM/NSI query for MSFT_NetTCPConnection failed.");
                 return null;
             }
         }
@@ -639,7 +638,7 @@ namespace NetworkWatchdogService
             }
             catch (Exception ex)
             {
-                _logger.LogCritical(ex, "Failed to resolve PID(s) for watched process name {name}.", processName);
+                _logger.LogWarning(ex, "Failed to resolve PID(s) for watched process name {name}.", processName);
                 return;
             }
 
@@ -647,14 +646,14 @@ namespace NetworkWatchdogService
             {
                 if (matches.Length == 0)
                 {
-                    _logger.LogCritical("Baseline resync: no running process named {name} found.", processName);
+                    _logger.LogDebug("Baseline resync: no running process named {name} found.", processName);
                     return;
                 }
 
                 foreach (var proc in matches)
                 {
                     int pid = proc.Id;
-                    _logger.LogCritical("Baseline resync: {name} (PID {pid}) = {val} ({source}).",
+                    _logger.LogDebug("Baseline resync: {name} (PID {pid}) = {val} ({source}).",
                         processName, pid,
                         counts.TryGetValue(pid, out int val) ? val.ToString() : "not present",
                         usedFallback ? "legacy GetExtendedTcpTable fallback" : "CIM/NSI");
@@ -668,7 +667,7 @@ namespace NetworkWatchdogService
 
         private void ResyncGlobalBaseline()
         {
-            _logger.LogCritical("Resyncing socket baselines...");
+            _logger.LogDebug("Resyncing socket baselines...");
 
             // CIM/NSI first - this is what actually sees LightingService's
             // leaked Bound sockets. Only fall back to the legacy IP Helper
@@ -676,6 +675,7 @@ namespace NetworkWatchdogService
             // instead of going blind.
             var counts = GetTcpConnectionCountsViaCim();
             bool usedFallback = false;
+            var healthSnapshots = new List<(int Pid, int Count)>();
 
             if (counts == null)
             {
@@ -683,11 +683,11 @@ namespace NetworkWatchdogService
                 {
                     counts = GetNativeTcpConnectionCounts();
                     usedFallback = true;
-                    _logger.LogCritical("CIM/NSI query failed; fell back to GetExtendedTcpTable, which will UNDERCOUNT bind()-only leaked sockets.");
+                    if (ShouldNotify("cim-fallback", TimeSpan.FromMinutes(5))) _logger.LogError("CIM/NSI query failed; fell back to GetExtendedTcpTable, which will UNDERCOUNT bind()-only leaked sockets.");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogCritical(ex, "Both CIM/NSI and the legacy native TCP table fetch failed this cycle; baseline not updated.");
+                    if (ShouldNotify("resync-total-failure", TimeSpan.FromMinutes(5))) _logger.LogCritical(ex, "Both CIM/NSI and the legacy native TCP table fetch failed this cycle; baseline not updated.");
                     SendSyslog(SyslogSeverity.Error, $"Baseline resync failed completely this cycle (both CIM/NSI and legacy fetch failed): {ex.Message}");
                     return;
                 }
@@ -697,7 +697,9 @@ namespace NetworkWatchdogService
             // fetch ran and shows exactly what it's seeing for the watched
             // process. Looked up by name, not a hardcoded PID - PIDs are
             // reassigned every time the process restarts.
-            LogCountForWatchedProcess(counts, "LightingService", usedFallback);
+            foreach (var monitored in _config.MonitoredServices)
+                if (!string.IsNullOrWhiteSpace(monitored.ServiceName))
+                    LogCountForWatchedProcess(counts, monitored.ServiceName, usedFallback);
 
             lock (_connectionCountsLock)
             {
@@ -725,23 +727,35 @@ namespace NetworkWatchdogService
                 {
                     if (kvp.Value >= 50)
                     {
-                        // Proof, not a guess: if this logs a number close to what
-                        // Get-NetTCPConnection shows for the same PID, resync is
-                        // reading reality correctly and the dashboard's gap is a
-                        // semantics issue (live AFD handles vs. all table rows,
-                        // including TIME_WAIT), not a fetch bug. If this NEVER
-                        // logs for a PID you know is leaking, resync still isn't
-                        // reaching that PID's true count.
-                        _logger.LogCritical("Baseline resync: PID {pid} has {count} native TCP table rows. BuildMarker={marker}", kvp.Key, kvp.Value, BuildMarker);
+                        _logger.LogDebug("Baseline resync: PID {pid} has {count} native TCP table rows.", kvp.Key, kvp.Value);
                     }
                     if (kvp.Key > 4)
                     {
                         _pidConnectionCounts[kvp.Key] = kvp.Value;
+                        if (kvp.Value >= TelemetryDisplayThreshold) healthSnapshots.Add((kvp.Key, kvp.Value));
                     }
                 }
 
                 PruneStaleCaches();
             }
+
+            // File I/O happens outside the lock the ETW consumer also takes. These snapshots are the
+            // leak-growth timeline that ends up in evidence bundles (and in HealthTrend_v2.csv).
+            foreach (var (pid, count) in healthSnapshots)
+                TelemetryExporter.RecordHealthSnapshot(ResolveProcessNameCached(pid), pid, count);
+        }
+
+        private string ResolveProcessNameCached(int pid)
+        {
+            if (_processNameCache.TryGetValue(pid, out string? cached)) return cached;
+            try
+            {
+                using var p = Process.GetProcessById(pid);
+                string name = p.ProcessName;
+                _processNameCache[pid] = name;
+                return name;
+            }
+            catch { return "unknown"; }
         }
 
         private void PruneStaleCaches()
@@ -906,10 +920,28 @@ namespace NetworkWatchdogService
                             string json = JsonSerializer.Serialize(packet);
                             await writer.WriteLineAsync(json.AsMemory(), token);
                         }
+                        else if (line == "GET_HISTORY")
+                        {
+                            var entries = await ReadMitigationHistoryAsync(MaxHistoryEntriesServed, token);
+                            string json = JsonSerializer.Serialize(new HistoryPacket { Entries = entries });
+                            await writer.WriteLineAsync(json.AsMemory(), token);
+                        }
+                        else if (line == "LIST_EVIDENCE")
+                        {
+                            // Metadata only (no file contents): the case files themselves stay in the
+                            // Administrators/SYSTEM-only folder and are exported via the control pipe.
+                            var list = new EvidenceListPacket { Cases = EvidenceCollector.ListCases(_evidenceDirectory) };
+                            string json = JsonSerializer.Serialize(list);
+                            await writer.WriteLineAsync(json.AsMemory(), token);
+                        }
                     }
                 }
                 catch (OperationCanceledException) { }
-                catch (Exception) { }
+                catch (Exception ex)
+                {
+                    // Was a bare catch that discarded everything.
+                    _logger.LogWarning(ex, "Telemetry pipe client handler failed.");
+                }
             }
         }
 
@@ -935,10 +967,26 @@ namespace NetworkWatchdogService
                             if (updateCmd != null) ApplyConfigUpdate(updateCmd);
                             await writer.WriteLineAsync("OK".AsMemory(), token);
                         }
+                        else if (line.StartsWith("CAPTURE_EVIDENCE:"))
+                        {
+                            // A capture legitimately takes longer than the normal 10 s IPC deadline.
+                            cts.CancelAfter(TimeSpan.FromSeconds(Math.Max(30, _config.Evidence.CaptureTimeoutSeconds) + 180));
+                            string reply = await HandleCaptureEvidenceCommandAsync(line.Substring("CAPTURE_EVIDENCE:".Length));
+                            await writer.WriteLineAsync(reply.AsMemory(), token);
+                        }
+                        else if (line.StartsWith("EXPORT_EVIDENCE:"))
+                        {
+                            cts.CancelAfter(TimeSpan.FromMinutes(10));      // large dumps can take a while to copy
+                            string reply = HandleExportEvidenceCommand(server, line.Substring("EXPORT_EVIDENCE:".Length));
+                            await writer.WriteLineAsync(reply.AsMemory(), token);
+                        }
                     }
                 }
                 catch (OperationCanceledException) { }
-                catch (Exception) { }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Control pipe client handler failed.");
+                }
             }
         }
 
@@ -970,7 +1018,8 @@ namespace NetworkWatchdogService
                 GlobalMaxTcpConnections = _globalMaxTcpConnections,
                 RecentRestarts = _recentRestarts.ToList(),
                 Whitelist = _whitelist.Keys.ToList(),
-                BuildMarker = BuildMarker
+                BuildMarker = BuildMarker,
+                EvidenceAutoCapture = _captureEvidenceBeforeMitigation && _config.Evidence.Enabled
             };
 
             foreach (var kvp in _pidConnectionCounts)
@@ -1003,13 +1052,16 @@ namespace NetworkWatchdogService
                 // looking at show up.
                 if (kvp.Value <= TelemetryDisplayThreshold) continue;
 
-                string status = kvp.Value < 500 ? "Healthy" : (kvp.Value < _globalMaxTcpConnections ? "Elevated" : "CRITICAL LEAK");
+                int processThreshold = ResolveThresholdForProcess(Path.GetFileNameWithoutExtension(procName)).Threshold;
+                double ratio = (double)kvp.Value / Math.Max(1, processThreshold);
+                string status = ratio >= StatusRedFraction ? "CRITICAL LEAK" : (ratio >= StatusAmberFraction ? "Elevated" : "Healthy");
                 packet.Processes.Add(new ProcessTelemetryItem
                 {
                     ServiceName = procName,
                     Pid = kvp.Key,
                     Connections = kvp.Value,
-                    Status = status
+                    Status = status,
+                    Threshold = processThreshold
                 });
             }
 
@@ -1046,6 +1098,12 @@ namespace NetworkWatchdogService
             if (whitelistChanged)
             {
                 _ = SaveWhitelistToDiskAsync();
+            }
+
+            if (cmd.AutoCaptureEvidence.HasValue)
+            {
+                _captureEvidenceBeforeMitigation = cmd.AutoCaptureEvidence.Value && _config.Evidence.Enabled;
+                _logger.LogInformation("IPC: capture-evidence-before-mitigation set to {val}.", _captureEvidenceBeforeMitigation);
             }
 
             if (cmd.SaveRequested == true)
@@ -1277,6 +1335,7 @@ namespace NetworkWatchdogService
         private class RuntimeOverrides
         {
             public int? GlobalMaxTcpConnections { get; set; }
+            public bool? CaptureEvidenceBeforeMitigation { get; set; }
         }
 
         /// <summary>
@@ -1307,6 +1366,11 @@ namespace NetworkWatchdogService
                 {
                     _globalMaxTcpConnections = saved;
                     _logger.LogInformation("Applied saved runtime override: GlobalMaxTcpConnections={val} (from {path}).", saved, _runtimeOverridesFilePath);
+                }
+                if (overrides?.CaptureEvidenceBeforeMitigation is bool savedCapture)
+                {
+                    _captureEvidenceBeforeMitigation = savedCapture && _config.Evidence.Enabled;
+                    _logger.LogInformation("Applied saved runtime override: CaptureEvidenceBeforeMitigation={val}.", _captureEvidenceBeforeMitigation);
                 }
             }
             catch (Exception ex)
@@ -1350,7 +1414,7 @@ namespace NetworkWatchdogService
                     }
                 }
 
-                var overrides = new RuntimeOverrides { GlobalMaxTcpConnections = _globalMaxTcpConnections };
+                var overrides = new RuntimeOverrides { GlobalMaxTcpConnections = _globalMaxTcpConnections, CaptureEvidenceBeforeMitigation = _captureEvidenceBeforeMitigation };
                 string tempPath = _runtimeOverridesFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(overrides));
                 try
@@ -1378,6 +1442,87 @@ namespace NetworkWatchdogService
             {
                 _runtimeOverridesFileLock.Release();
             }
+        }
+
+        /// <summary>
+        /// Appends one mitigation record to MitigationHistory.csv (cross-reboot archive).
+        /// Same directory lock-down and verification discipline as the whitelist file; capped
+        /// at 5 MB with a single rotated backup (.1) so it cannot grow without bound.
+        /// Fire-and-forget safe: failures are logged and never affect the restart itself.
+        /// </summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task AppendMitigationHistoryAsync(string csvLine)
+        {
+            await _mitigationHistoryLock.WaitAsync();
+            try
+            {
+                string? dir = Path.GetDirectoryName(_mitigationHistoryFilePath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                    try { SecureDirectoryToAdminsAndSystem(dir); }
+                    catch (Exception ex) { _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir); }
+
+                    if (!IsAdminOnlyLocation(dir, isDirectory: true))
+                    {
+                        _logger.LogCritical("Not writing mitigation history: {dir} is not exclusively controlled by Administrators/SYSTEM.", dir);
+                        return;
+                    }
+                }
+
+                var fi = new FileInfo(_mitigationHistoryFilePath);
+                if (fi.Exists && fi.Length > MaxMitigationHistoryBytes)
+                    File.Move(_mitigationHistoryFilePath, _mitigationHistoryFilePath + ".1", overwrite: true);
+
+                await File.AppendAllTextAsync(_mitigationHistoryFilePath, csvLine + Environment.NewLine, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to append to mitigation history {path}.", _mitigationHistoryFilePath);
+            }
+            finally
+            {
+                _mitigationHistoryLock.Release();
+            }
+        }
+
+        /// <summary>Returns the newest <paramref name="maxEntries"/> history lines (oldest first).</summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task<List<string>> ReadMitigationHistoryAsync(int maxEntries, CancellationToken token)
+        {
+            var result = new List<string>();
+            await _mitigationHistoryLock.WaitAsync(token);
+            try
+            {
+                if (!File.Exists(_mitigationHistoryFilePath)) return result;
+
+                string? dir = Path.GetDirectoryName(_mitigationHistoryFilePath);
+                if (string.IsNullOrEmpty(dir) ||
+                    !IsAdminOnlyLocation(dir, isDirectory: true) ||
+                    !IsAdminOnlyLocation(_mitigationHistoryFilePath, isDirectory: false))
+                {
+                    _logger.LogCritical("Refusing to serve mitigation history from {path}: not exclusively owned/writable by Administrators or SYSTEM.", _mitigationHistoryFilePath);
+                    return result;
+                }
+
+                var tail = new Queue<string>(maxEntries + 1);
+                foreach (var line in File.ReadLines(_mitigationHistoryFilePath))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    tail.Enqueue(line);
+                    if (tail.Count > maxEntries) tail.Dequeue();
+                }
+                result.AddRange(tail);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to read mitigation history {path}.", _mitigationHistoryFilePath);
+            }
+            finally
+            {
+                _mitigationHistoryLock.Release();
+            }
+            return result;
         }
 
         [System.Runtime.Versioning.SupportedOSPlatform("windows")]
@@ -1550,7 +1695,30 @@ namespace NetworkWatchdogService
             }
         }
 
-        private async Task RestartLeakingServiceAsync(string fallbackServiceName, int processId, int socketCount, DateTime expectedStartTime)
+        // =====================================================================================
+        // Restart pipeline (v3.9.0): discover related processes -> capture evidence -> stop -> kill
+        // -> restart target -> restart related services.
+        // =====================================================================================
+        private const string DependentServiceReason = "dependent service";
+
+        private sealed record RelatedProcess(int Pid, DateTime StartTime, string Name, string? ServiceName, string Reason);
+
+        // Never terminated as a "related" process, whatever discovers it (shared service hosts
+        // such as svchost would take unrelated services down with them).
+        private static readonly HashSet<string> NeverTerminateNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso",
+            "svchost", "fontdrvhost", "dwm", "explorer", "memory compression", "secure system"
+        };
+
+        // Never dumped on request: credential / kernel-critical processes.
+        private static readonly HashSet<string> NeverDumpNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso",
+            "secure system", "memory compression"
+        };
+
+        private async Task RestartLeakingServiceAsync(string fallbackServiceName, int processId, int socketCount, DateTime expectedStartTime, int thresholdAtBreach)
         {
             try
             {
@@ -1563,87 +1731,100 @@ namespace NetworkWatchdogService
                 string? actualServiceName = GetServiceNameFromPidCached(processId);
                 string? scmServiceName = IsValidServiceName(actualServiceName) ? actualServiceName : null;
                 string serviceNameToUse = scmServiceName ?? fallbackServiceName;
+                string cleanName = Path.GetFileNameWithoutExtension(fallbackServiceName);
 
-                // Discover, by file lock (not by name), any OTHER process holding
-                // the target's own executable open - this is what "a related
-                // process blocks the restart" actually means at the OS level, and
-                // it works for any leaking process, not just ones named in config.
-                // Deliberately queried BEFORE the target is killed, while its exe
-                // path is still readable from the live process.
                 string? exePath = null;
                 try { exePath = proc?.MainModule?.FileName; }
-                catch (Exception ex) { _logger.LogInformation(ex, "Could not read MainModule.FileName for PID {pid}; skipping dependent-process discovery.", processId); }
+                catch (Exception ex) { _logger.LogInformation(ex, "Could not read MainModule.FileName for PID {pid}; file-lock discovery skipped.", processId); }
 
-                var blockingPids = !string.IsNullOrEmpty(exePath)
-                    ? GetProcessesLockingFile(exePath, processId)
-                    : new List<int>();
-
-                if (blockingPids.Count > 0)
+                // 1) Everything that blocks, or must accompany, this restart - found dynamically,
+                //    while the target is still alive and its executable path is still readable.
+                var related = DiscoverRelatedProcesses(processId, exePath, scmServiceName, cleanName);
+                if (related.Count > 0)
                 {
-                    _logger.LogWarning("Restart Manager reports {count} other process(es) locking {path}; these will be terminated alongside PID {pid} so the restart isn't blocked.",
-                        blockingPids.Count, exePath, processId);
-                    SendSyslog(SyslogSeverity.Notice, $"Terminating {blockingPids.Count} dependent process(es) blocking restart of PID {processId} ({exePath}).");
+                    string summary = string.Join("; ", related.Select(r => $"{r.Name} (PID {r.Pid}, {r.Reason})"));
+                    _logger.LogWarning("{count} related process(es) will be restarted with PID {pid}: {summary}", related.Count, processId, summary);
+                    SendSyslog(SyslogSeverity.Notice, $"Restarting {related.Count} related process(es) together with PID {processId}: {summary}");
                 }
 
+                // 2) Evidence FIRST: once the process is killed its sockets, handles and memory are gone.
+                //    Bounded by EvidenceConfig.CaptureTimeoutSeconds; a failure here never blocks the restart.
+                PendingEvidenceCase? evidence = null;
+                if (ShouldCaptureEvidenceAutomatically(cleanName))
+                {
+                    _lastAutoEvidence[cleanName] = DateTime.UtcNow;
+                    evidence = await CaptureEvidenceAsync(processId, fallbackServiceName, scmServiceName, exePath, "auto-breach",
+                        socketCount, thresholdAtBreach,
+                        related.Select(r => $"{r.Name} (PID {r.Pid}) - {r.Reason}").ToList(),
+                        TimeSpan.FromSeconds(Math.Max(10, _config.Evidence.CaptureTimeoutSeconds)));
+                }
+
+                // 3) Stop. Dependents first (a service with running dependents cannot stop cleanly),
+                //    then the target through the Service Control Manager.
                 _logger.LogWarning("Force killing leaking process/service {serviceName} (PID {pid})...", serviceNameToUse, processId);
 
+                foreach (var dep in related.Where(r => r.Reason == DependentServiceReason && r.ServiceName != null))
+                    ExecuteSafeCommand("sc.exe", new[] { "stop", dep.ServiceName! }, suppressErrors: true);
                 if (scmServiceName != null)
-                {
                     ExecuteSafeCommand("sc.exe", new[] { "stop", scmServiceName }, suppressErrors: true);
-                }
 
-                if (!TryVerifySamePid(processId, expectedStartTime, out _))
+                // 4) Kill - but only the exact process instance that triggered this. If 'sc stop' already
+                //    ended it (or the PID was recycled) there is nothing to kill; the restart continues
+                //    either way. (Previously this case returned early and left the service stopped.)
+                if (TryVerifySamePid(processId, expectedStartTime, out _))
                 {
-                    _logger.LogInformation("PID {pid} was recycled before taskkill could run; aborting to avoid killing an unrelated process.", processId);
-                    proc?.Dispose();
-                    return;
+                    ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", processId.ToString() });
                 }
-                ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", processId.ToString() });
+                else
+                {
+                    _logger.LogInformation("PID {pid} already exited (or was recycled); not killing, continuing with the restart.", processId);
+                }
                 proc?.Dispose();
 
-                // Terminate each discovered blocking process too, with the same
-                // whitelist respect as the primary target. Each gets its own
-                // fresh Process.GetProcessById lookup immediately before acting,
-                // so one that already exited between discovery and now is simply
-                // skipped rather than acted on blind.
-                foreach (int blockingPid in blockingPids)
+                // Related processes: each is re-verified against the start time captured at discovery
+                // immediately before it is touched, so one that already exited (or whose PID was
+                // recycled) is skipped rather than acted on blind.
+                if (related.Count > 0) await Task.Delay(2000);
+                foreach (var r in related)
                 {
                     try
                     {
-                        using var blockingProc = Process.GetProcessById(blockingPid);
-                        string blockingName = blockingProc.ProcessName;
-                        string blockingClean = Path.GetFileNameWithoutExtension(blockingName);
-
-                        if (_whitelist.ContainsKey(blockingClean) || _whitelist.ContainsKey(blockingName))
+                        if (!TryVerifySamePid(r.Pid, r.StartTime, out Process? rp)) continue;
+                        using (rp)
                         {
-                            _logger.LogInformation("Not terminating blocking process {name} (PID {pid}): whitelisted.", blockingName, blockingPid);
-                            continue;
+                            if (CountServicesInProcess(r.Pid) > 1)
+                            {
+                                _logger.LogInformation("Not terminating {name} (PID {pid}): the process hosts several services.", r.Name, r.Pid);
+                                continue;
+                            }
+                            _logger.LogWarning("Terminating {name} (PID {pid}): {reason} of {target} (PID {targetPid}).",
+                                r.Name, r.Pid, r.Reason, serviceNameToUse, processId);
+                            ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", r.Pid.ToString() });
                         }
-
-                        _logger.LogWarning("Terminating {name} (PID {pid}): blocking restart of {target} (PID {targetPid}).",
-                            blockingName, blockingPid, serviceNameToUse, processId);
-                        ExecuteSafeCommand("taskkill.exe", new[] { "/F", "/T", "/PID", blockingPid.ToString() });
                     }
-                    catch (ArgumentException)
-                    {
-                        // Already exited between discovery and now - nothing to do.
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to terminate blocking PID {pid}.", blockingPid);
-                    }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Failed to terminate related PID {pid}.", r.Pid); }
                 }
 
-                _recentRestarts.Enqueue($"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss},{serviceNameToUse},{processId},Exceeded {socketCount} sockets");
+                // Commas/newlines in a process name would corrupt the CSV the dashboard parses.
+                string csvName = serviceNameToUse.Replace(',', '_').Replace('\r', ' ').Replace('\n', ' ');
+                string mitigationLine = $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss},{csvName},{processId},Exceeded {socketCount} sockets";
+                _recentRestarts.Enqueue(mitigationLine);
                 while (_recentRestarts.Count > 50 && _recentRestarts.TryDequeue(out _)) { }
+                _ = AppendMitigationHistoryAsync(mitigationLine);
+                TelemetryExporter.RecordRestart(serviceNameToUse, processId, $"Exceeded {socketCount} sockets (threshold {thresholdAtBreach})");
 
                 _pidConnectionCounts.TryRemove(processId, out _);
                 _pidStartTimes.TryRemove(processId, out _);
                 _processNameCache.TryRemove(processId, out _);
                 _serviceNameCache.TryRemove(processId, out _);
 
+                // Packaging (hashing + zipping) can take a while for a large dump, so it runs in the
+                // background now that the process is gone.
+                if (evidence != null) _ = FinalizeEvidenceAsync(evidence);
+
                 await Task.Delay(30000);
 
+                // 5) Bring everything back through the SCM only (no standalone relaunch: removed as an LPE risk).
                 if (scmServiceName == null)
                 {
                     _logger.LogInformation("PID {pid} ({name}) is not a registered Windows service; it was terminated and will not be relaunched.", processId, serviceNameToUse);
@@ -1651,16 +1832,369 @@ namespace NetworkWatchdogService
                 else if (await TryStartServiceAsync(scmServiceName))
                 {
                     _logger.LogInformation("Service {serviceName} is running again after the restart.", scmServiceName);
+                    SendSyslog(SyslogSeverity.Informational, $"Service {scmServiceName} is running again after the mitigation.");
                 }
                 else
                 {
                     _logger.LogWarning("Service {serviceName} was not confirmed running after the restart attempt. " +
                         "Standalone executable relaunch is disabled by design; manual intervention may be required.", scmServiceName);
+                    SendSyslog(SyslogSeverity.Error, $"Service {scmServiceName} was NOT confirmed running after the mitigation; manual intervention may be required.");
                 }
+
+                var relatedServices = related
+                    .Where(r => IsValidServiceName(r.ServiceName))
+                    .Select(r => r.ServiceName!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Where(n => !string.Equals(n, scmServiceName, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                foreach (var svc in relatedServices)
+                {
+                    if (await TryStartServiceAsync(svc)) _logger.LogInformation("Related service {serviceName} is running again.", svc);
+                    else _logger.LogWarning("Related service {serviceName} was not confirmed running after the restart.", svc);
+                }
+                foreach (var r in related.Where(r => !IsValidServiceName(r.ServiceName)))
+                    _logger.LogInformation("{name} (PID {pid}) was terminated with the target; it is not a Windows service and is not relaunched.", r.Name, r.Pid);
             }
             finally
             {
                 _activeRestarts.TryRemove(processId, out _);
+            }
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Related-process discovery. Three independent, universal sources (no hardcoded names):
+        //   1. Windows services that DEPEND on the target service (they must stop before it can),
+        //   2. other processes locking the target's executable (Restart Manager),
+        //   3. other processes in the same MonitoredServices entry's ProcessTree (explicit config -
+        //      this is the legacy v2.x behaviour of restarting the whole tree together).
+        // -------------------------------------------------------------------------------------
+        private List<RelatedProcess> DiscoverRelatedProcesses(int targetPid, string? exePath, string? scmServiceName, string cleanName)
+        {
+            var found = new Dictionary<int, RelatedProcess>();
+
+            void Add(int pid, string reason, string? serviceName)
+            {
+                if (pid <= 4 || pid == targetPid || pid == Environment.ProcessId || found.ContainsKey(pid)) return;
+                try
+                {
+                    using var p = Process.GetProcessById(pid);
+                    string name = p.ProcessName;
+                    string clean = Path.GetFileNameWithoutExtension(name);
+                    if (NeverTerminateNames.Contains(clean)) return;
+                    if (_whitelist.ContainsKey(clean) || _whitelist.ContainsKey(name)) return;
+
+                    string? svc = serviceName;
+                    if (svc == null)
+                    {
+                        string? resolved = GetServiceNameFromPidCached(pid);
+                        if (IsValidServiceName(resolved)) svc = resolved;
+                    }
+                    found[pid] = new RelatedProcess(pid, p.StartTime, name, svc, reason);
+                }
+                catch { /* exited or inaccessible: nothing to restart */ }
+            }
+
+            try
+            {
+                if (scmServiceName != null)
+                    foreach (var dep in GetRunningDependentServices(scmServiceName, 0))
+                        Add(dep.Pid, DependentServiceReason, dep.Name);
+
+                if (!string.IsNullOrEmpty(exePath))
+                    foreach (int pid in GetProcessesLockingFile(exePath, targetPid))
+                        Add(pid, "locks the target executable", null);
+
+                if (_serviceConfigByProcessName.TryGetValue(cleanName, out var cfg))
+                {
+                    foreach (var name in cfg.ProcessTree.Append(cfg.ServiceName).Distinct(StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (string.IsNullOrWhiteSpace(name) || string.Equals(name, cleanName, StringComparison.OrdinalIgnoreCase)) continue;
+                        Process[] matches;
+                        try { matches = Process.GetProcessesByName(name); } catch { continue; }
+                        foreach (var m in matches)
+                        {
+                            try { Add(m.Id, "configured ProcessTree member", null); }
+                            finally { m.Dispose(); }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Related-process discovery failed; continuing with the primary target only.");
+            }
+
+            return found.Values.ToList();
+        }
+
+        /// <summary>Running services that (transitively) depend on the given service, via WMI.</summary>
+        private List<(string Name, int Pid)> GetRunningDependentServices(string serviceName, int depth)
+        {
+            var result = new List<(string Name, int Pid)>();
+            if (depth > 4 || serviceName.Contains('\'')) return result;
+
+            try
+            {
+                // Services that depend ON serviceName play the "Dependent" role of Win32_DependentService;
+                // serviceName itself is the "Antecedent".
+                using var searcher = new ManagementObjectSearcher(
+                    $"ASSOCIATORS OF {{Win32_Service.Name='{serviceName}'}} WHERE AssocClass=Win32_DependentService Role=Antecedent");
+                foreach (ManagementObject o in searcher.Get())
+                {
+                    string? name = o["Name"]?.ToString();
+                    string? state = o["State"]?.ToString();
+                    if (string.IsNullOrEmpty(name) || !IsValidServiceName(name)) continue;
+                    if (!string.Equals(state, "Running", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    int pid = Convert.ToInt32(o["ProcessId"] ?? 0);
+                    if (result.All(r => !string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        result.Add((name, pid));
+                        foreach (var nested in GetRunningDependentServices(name, depth + 1))
+                            if (result.All(r => !string.Equals(r.Name, nested.Name, StringComparison.OrdinalIgnoreCase)))
+                                result.Add(nested);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not enumerate dependent services of {service}.", serviceName);
+            }
+            return result;
+        }
+
+        private int CountServicesInProcess(int pid)
+        {
+            try
+            {
+                using var searcher = new ManagementObjectSearcher($"SELECT Name FROM Win32_Service WHERE ProcessId = {pid}");
+                return searcher.Get().Count;
+            }
+            catch { return 1; }
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Evidence capture (see EvidenceCollector.cs)
+        // -------------------------------------------------------------------------------------
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private string? EnsureSecureDataDirectory()
+        {
+            try
+            {
+                string? dir = Path.GetDirectoryName(_whitelistFilePath);
+                if (string.IsNullOrEmpty(dir)) return null;
+                Directory.CreateDirectory(dir);
+                try { SecureDirectoryToAdminsAndSystem(dir); }
+                catch (Exception ex) { _logger.LogError(ex, "Failed to lock down ACLs on {dir}.", dir); }
+                return IsAdminOnlyLocation(dir, isDirectory: true) ? dir : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not prepare the secure data directory.");
+                return null;
+            }
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private string? EnsureEvidenceDirectory()
+        {
+            if (EnsureSecureDataDirectory() == null) return null;
+            try
+            {
+                Directory.CreateDirectory(_evidenceDirectory);
+                return IsAdminOnlyLocation(_evidenceDirectory, isDirectory: true) ? _evidenceDirectory : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not prepare the evidence directory {dir}.", _evidenceDirectory);
+                return null;
+            }
+        }
+
+        private bool ShouldCaptureEvidenceAutomatically(string cleanName)
+        {
+            var ev = _config.Evidence;
+            if (!ev.Enabled || !_captureEvidenceBeforeMitigation) return false;
+            if (_lastAutoEvidence.TryGetValue(cleanName, out DateTime last) &&
+                DateTime.UtcNow - last < TimeSpan.FromMinutes(Math.Max(0, ev.MinIntervalMinutes)))
+            {
+                _logger.LogInformation("Evidence for {name} was captured recently; skipping this time (MinIntervalMinutes={min}).", cleanName, ev.MinIntervalMinutes);
+                return false;
+            }
+            return true;
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task<PendingEvidenceCase?> CaptureEvidenceAsync(
+            int pid, string processName, string? serviceName, string? exePath, string trigger,
+            int connections, int threshold, List<string> relatedDescriptions, TimeSpan budget)
+        {
+            try
+            {
+                string? dir = EnsureEvidenceDirectory();
+                if (dir == null)
+                {
+                    _logger.LogError("Evidence capture skipped: the evidence directory is not exclusively controlled by Administrators/SYSTEM.");
+                    return null;
+                }
+
+                if (!await _evidenceLock.WaitAsync(budget))
+                {
+                    _logger.LogWarning("Evidence capture skipped: another capture is still running.");
+                    return null;
+                }
+
+                try
+                {
+                    var history = await ReadMitigationHistoryAsync(200, CancellationToken.None);
+                    var request = new EvidenceRequest
+                    {
+                        ProcessId = pid,
+                        ProcessName = processName,
+                        ServiceName = serviceName,
+                        ExecutablePath = exePath,
+                        Trigger = trigger,
+                        Connections = connections,
+                        Threshold = threshold,
+                        DumpMode = _config.Evidence.DumpMode,
+                        BuildMarker = BuildMarker,
+                        EvidenceDirectory = dir,
+                        RelatedProcesses = relatedDescriptions,
+                        HistoryLines = history,
+                        ConfigSnapshotJson = JsonSerializer.Serialize(new
+                        {
+                            EffectiveGlobalMaxTcpConnections = _globalMaxTcpConnections,
+                            EvidenceAutoCapture = _captureEvidenceBeforeMitigation,
+                            Config = _config
+                        }, new JsonSerializerOptions { WriteIndented = true })
+                    };
+
+                    _logger.LogWarning("Capturing evidence for {name} (PID {pid}) before mitigation (budget {sec}s, dump mode {mode}).",
+                        processName, pid, (int)budget.TotalSeconds, request.DumpMode);
+
+                    using var cts = new CancellationTokenSource(budget);
+                    return await EvidenceCollector.CollectAsync(request, _logger, cts.Token);
+                }
+                finally
+                {
+                    _evidenceLock.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Evidence capture failed for PID {pid}; the mitigation continues without it.", pid);
+                return null;
+            }
+        }
+
+        private async Task FinalizeEvidenceAsync(PendingEvidenceCase pending)
+        {
+            var info = await EvidenceCollector.PackageAsync(pending, _logger);
+            if (info == null) return;
+
+            EvidenceCollector.ApplyRetention(_evidenceDirectory, Math.Max(1, _config.Evidence.MaxCases), _logger);
+            _logger.LogWarning("Evidence case {case} saved ({mb} MB).", info.CaseId, info.SizeBytes / (1024 * 1024));
+            SendSyslog(SyslogSeverity.Notice, $"Evidence case {info.CaseId} saved ({info.SizeBytes / (1024 * 1024)} MB).");
+            if (pending.Warnings.Count > 0)
+                _logger.LogInformation("Evidence case {case} finished with {n} warning(s); see 00_Manifest.json.", info.CaseId, pending.Warnings.Count);
+        }
+
+        /// <summary>CAPTURE_EVIDENCE:{"Pid":123} (admin control pipe). Non-destructive: the process keeps running.</summary>
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private async Task<string> HandleCaptureEvidenceCommandAsync(string json)
+        {
+            try
+            {
+                if (!_config.Evidence.Enabled) return "ERR:Evidence capture is disabled in the service configuration.";
+
+                CaptureEvidenceCommand? cmd = null;
+                try { cmd = JsonSerializer.Deserialize<CaptureEvidenceCommand>(json); } catch { }
+                if (cmd == null || cmd.Pid <= 4) return "ERR:Invalid request.";
+
+                Process proc;
+                try { proc = Process.GetProcessById(cmd.Pid); }
+                catch { return "ERR:The process no longer exists."; }
+
+                using (proc)
+                {
+                    string name = proc.ProcessName;
+                    string clean = Path.GetFileNameWithoutExtension(name);
+                    if (NeverDumpNames.Contains(clean)) return $"ERR:Refusing to capture a protected system process ({clean}).";
+
+                    string? exePath = null;
+                    try { exePath = proc.MainModule?.FileName; } catch { }
+                    string? svc = GetServiceNameFromPidCached(cmd.Pid);
+                    if (!IsValidServiceName(svc)) svc = null;
+
+                    int connections = _pidConnectionCounts.TryGetValue(cmd.Pid, out int c) ? c : 0;
+                    int threshold = ResolveThresholdForProcess(clean).Threshold;
+
+                    var pending = await CaptureEvidenceAsync(cmd.Pid, name, svc, exePath, "manual", connections, threshold,
+                        new List<string>(), TimeSpan.FromSeconds(Math.Max(30, _config.Evidence.CaptureTimeoutSeconds)));
+                    if (pending == null) return "ERR:Capture failed - see the service log.";
+
+                    var info = await EvidenceCollector.PackageAsync(pending, _logger);
+                    if (info == null) return "ERR:Packaging failed - see the service log.";
+
+                    EvidenceCollector.ApplyRetention(_evidenceDirectory, Math.Max(1, _config.Evidence.MaxCases), _logger);
+                    SendSyslog(SyslogSeverity.Notice, $"Manual evidence case {info.CaseId} saved.");
+                    return "OK:" + info.CaseId;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "CAPTURE_EVIDENCE failed.");
+                return "ERR:" + ex.Message.Replace('\r', ' ').Replace('\n', ' ');
+            }
+        }
+
+        /// <summary>
+        /// EXPORT_EVIDENCE:{"CaseId":"...","DestinationPath":"C:\\...\\x.zip"} (admin control pipe).
+        /// The case file is opened here, as SYSTEM, but the DESTINATION is written while impersonating the
+        /// pipe client. Windows therefore enforces the caller's own permissions on the destination: the
+        /// service cannot be used to write anywhere the caller could not write himself.
+        /// </summary>
+        private string HandleExportEvidenceCommand(NamedPipeServerStream server, string json)
+        {
+            try
+            {
+                ExportEvidenceCommand? cmd = null;
+                try { cmd = JsonSerializer.Deserialize<ExportEvidenceCommand>(json); } catch { }
+                if (cmd == null || !EvidenceCollector.IsValidCaseId(cmd.CaseId)) return "ERR:Invalid case id.";
+
+                string? zip = EvidenceCollector.FindCaseZip(_evidenceDirectory, cmd.CaseId);
+                if (zip == null) return "ERR:Evidence case not found.";
+
+                string dest;
+                try { dest = Path.GetFullPath(cmd.DestinationPath ?? string.Empty); }
+                catch { return "ERR:Invalid destination path."; }
+                if (!dest.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) || dest.StartsWith(@"\\", StringComparison.Ordinal))
+                    return "ERR:The destination must be a local .zip file path.";
+
+                using var source = new FileStream(zip, FileMode.Open, FileAccess.Read, FileShare.Read);
+                string? error = null;
+                server.RunAsClient(() =>
+                {
+                    try
+                    {
+                        string? destDir = Path.GetDirectoryName(dest);
+                        if (string.IsNullOrEmpty(destDir) || !Directory.Exists(destDir)) { error = "The destination folder does not exist."; return; }
+                        using var target = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None);
+                        source.CopyTo(target);
+                        target.Flush();
+                    }
+                    catch (Exception ex) { error = ex.Message; }
+                });
+
+                if (error != null) return "ERR:" + error.Replace('\r', ' ').Replace('\n', ' ');
+                _logger.LogInformation("Evidence case {case} exported to {dest}.", cmd.CaseId, dest);
+                SendSyslog(SyslogSeverity.Notice, $"Evidence case {cmd.CaseId} exported.");
+                return "OK";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "EXPORT_EVIDENCE failed.");
+                return "ERR:" + ex.Message.Replace('\r', ' ').Replace('\n', ' ');
             }
         }
 
@@ -1894,7 +2428,12 @@ namespace NetworkWatchdogService
                     psi.ArgumentList.Add(arg);
                 }
                 using var proc = Process.Start(psi);
-                proc?.WaitForExit();
+                // Bounded wait: a hung sc.exe/taskkill.exe must never stall the whole restart pipeline.
+                if (proc != null && !proc.WaitForExit(30_000))
+                {
+                    try { proc.Kill(true); } catch { }
+                    if (!suppressErrors) _logger.LogWarning("Command timed out after 30 s and was terminated: {filename}", filename);
+                }
             }
             catch (Exception ex)
             {

@@ -4,6 +4,61 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.9.0] - 2026-10-29
+
+### Added
+
+- **Pre-mitigation R&D evidence capture (service)**: Right before a leaking process is stopped, the service captures a complete evidence case while the leak is still in progress: target TCP/UDP socket tables (state histogram, `Bound` detection, port range), system socket baseline, process table by handles/pool, loaded modules, connection-growth timeline and rate, kernel pool and TCP counters, recent event logs (including Tcpip port-exhaustion and Service Control Manager events), network configuration, mitigation history, service configuration, a memory dump (`Full`, `Standard` or `None`), `README_FOR_RD.txt` and `SHA256SUMS.txt`. Bounded by `Evidence.CaptureTimeoutSeconds`; a failure never blocks the restart; packaging finishes in the background. New `Evidence` section in `appsettings.json` (`Enabled`, `CaptureBeforeMitigation`, `DumpMode`, `MaxCases`, `MinIntervalMinutes`, `CaptureTimeoutSeconds`).
+- **One-click evidence in the dashboard**: New *Evidence Cases* tab, a *Collect Evidence (1 click)* button on the Live Processes tab and a tray-menu entry. The service captures, the finished `.zip` is saved where the user chooses. An unelevated dashboard offers to restart itself as Administrator; a limited local collector remains as a fallback for older services.
+- **Evidence IPC commands**: `LIST_EVIDENCE` (telemetry pipe, metadata only), `CAPTURE_EVIDENCE` and `EXPORT_EVIDENCE` (Administrators-only control pipe). Export writes the destination while impersonating the caller (`RunAsClient`), so the caller's own permissions apply.
+- **Capture switch in the dashboard**: *Capture R&D evidence automatically before a leaking process is restarted* (Settings tab), persisted in `runtime-overrides.json`.
+- **Related-process discovery and restart (service)**: Running dependent services (WMI), processes locking the target executable (Restart Manager) and the configured `ProcessTree` are restarted together with the leaking process; the target and then each related service are brought back through the SCM and verified `RUNNING`.
+- **Persistent mitigation archive (service)**: Each mitigation is appended to `%ProgramData%\NetworkWatchdogService\MitigationHistory.csv` (5 MB cap, one rotated `.1` backup, Administrators/SYSTEM ACL verification) and served through the read-only `GET_HISTORY` IPC command.
+- **Per-process `Threshold` in telemetry** and **threshold-relative health banding**: tray icon, tooltip, manual-kill menu, Live Processes status colours and the service-side `Status` text scale with the active threshold (amber at 50 %, red at 80 %), including per-service overrides.
+- **`TelemetryExporter` wired**: `HealthTrend_v2.csv` and `RestartEvents_v2.csv` under `%ProgramData%\NetworkWatchdogService\` (10 MB cap, one backup); they feed the evidence growth timeline.
+- **TrayApp hardening**: Bounded IPC reads, pipe-server identity verification, native `Process.Kill`, kill-time identity re-check, whitelist input sanitization, `TrayLogger` (`%LocalAppData%\NetworkWatchdog\tray.log`) and global exception handlers.
+- **Service build shown in the dashboard** (`BuildMarker`) on the Live Processes tab.
+- **`scripts\Test-NativeInterop.ps1`**: verifies the native calls the service and tray rely on (pipe-server identity, Restart Manager, `MiniDumpWriteDump`, WMI dependent services) on a real machine and writes a report.
+- **`Logging:EventLog:LogLevel`** in `appsettings.json` so Information-level entries are visible in Event Viewer.
+
+### Changed
+
+- **`SyslogNotifier` is the single syslog implementation** (shared `SyslogSeverity`, RFC 3164 space-padded day and local time, one reused socket); `Worker` delegates to it. The original `SendAlert` signature is preserved.
+- **`TelemetryExporter` moved** from the install directory to `%ProgramData%\NetworkWatchdogService\` and only initializes after the folder is verified Administrators/SYSTEM-only.
+- **`ProcessTree` semantics restored**: members are restarted together with the leaking process (legacy v2.x behaviour), in addition to the dynamic discovery above.
+- **Diagnostic logging demoted**: the Critical-level diagnostics (several entries every 15 seconds) are now Debug/Warning/Information; the hardcoded `"LightingService"` diagnostic iterates `MonitoredServices`.
+- **Repeated notices are rate-limited**: breach (60 s), cooldown (60 s) and quarantine (10 min), including their syslog packets.
+- **`ExecuteSafeCommand` is bounded** (30 seconds, then the process is terminated).
+- **Evidence audit trail** is fetched from the service over IPC instead of copying the locked ProgramData file.
+- **Memory-dump export asks for confirmation** because a dump can contain credentials and personal data.
+- **Documentation**: handbook Trials 47-67, corrected `state.json` references (the service persists `whitelist.json` and `runtime-overrides.json`), config matrix, workflow, file tree and backlog; README and skill file actualized.
+
+### Fixed
+
+- **Historical Archive tab was always empty and Reload did nothing**: nothing wrote the archive, the folder is locked to Administrators/SYSTEM, and a bare `catch` hid both. The service now writes and serves it; the tab states the exact reason when history is unavailable.
+- **Tray icon never turned red**: fixed 500/1000 bands made red unreachable because processes are restarted at about 1001. Bands now follow the selected threshold.
+- **Tray showed grey "Connecting..." on a healthy system**: an empty process list is no longer treated as a disconnect.
+- **Restart balloon alerts stopped after the first mitigation**: the tray read the oldest queue entry as "latest".
+- **Tooltip crash risk**: `NotifyIcon.Text` is truncated to 127 characters.
+- **Service could be left stopped after a mitigation**: when `sc stop` had already ended the process, the restart returned early; it now continues.
+- **Evidence for a process was captured after it had been killed** (v3.8.0 tray-side design): capture now happens before the kill, in the service.
+- **Automatic evidence bundles could not be written** (install directory): superseded by service-side capture.
+- **Silent failures**: telemetry/control pipe handlers and the detection loop no longer swallow exceptions without a trace.
+
+### Removed
+
+- **Post-mitigation "Auto-Target Top Socket Consuming Process for Dumps"** tray option: replaced by the pre-kill capture switch above.
+
+---
+
+## [3.8.0] - 2026-10-06
+
+### Added
+
+- **R&D Diagnostic Evidence Suite**: Added a comprehensive forensic export engine that packages system port limits, CIM socket tables, active process metrics, historical restart audit logs, event logs, and memory dumps into a single `.zip` file for vendor ticket submissions.
+- **Native Memory Minidumps**: Integrated `DbgHelp.dll` (`MiniDumpWriteDump`) directly into the TrayApp to capture unmanaged memory dumps (`.dmp`) of leaking processes on demand.
+- **Dual Diagnostic Targeting Modes**: Users can manually select any active PID and invoke a "Save As" dialog, or check "Auto-Target Top Socket Consuming Process for Dumps" to save bundles directly to the application directory.
+
 ## [3.7.2] - 2026-10-06
 
 ### Added
