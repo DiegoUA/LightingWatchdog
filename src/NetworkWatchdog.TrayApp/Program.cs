@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
 using System.IO.Pipes;
 using System.Linq;
 using System.Net.Http;
@@ -253,6 +254,11 @@ namespace NetworkWatchdog.TrayApp
                     {
                         _trayIcon.ShowBalloonTip(4000, "⚠️ Socket Leak Mitigated!", $"Rogue sockets cleared:\n{latestRestart}", ToolTipIcon.Warning);
                     }
+
+                    if (_dashboardForm != null && !_dashboardForm.IsDisposed)
+                    {
+                        _ = _dashboardForm.AutoCollectTopProcessDumpAsync();
+                    }
                 }
             }
 
@@ -280,7 +286,7 @@ namespace NetworkWatchdog.TrayApp
 
         public static Version GetCurrentVersion()
         {
-            return Assembly.GetExecutingAssembly().GetName().Version ?? new Version(3, 7, 2, 0);
+            return Assembly.GetExecutingAssembly().GetName().Version ?? new Version(3, 8, 0, 0);
         }
 
         public static async Task CheckForUpdatesAsync(bool manualCheck = false)
@@ -377,6 +383,151 @@ namespace NetworkWatchdog.TrayApp
         }
     }
 
+    public static class EvidenceCollector
+    {
+        [DllImport("DbgHelp.dll", SetLastError = true)]
+        private static extern bool MiniDumpWriteDump(
+            IntPtr hProcess,
+            uint processId,
+            SafeHandle hFile,
+            uint dumpType,
+            IntPtr expParam,
+            IntPtr userStreamParam,
+            IntPtr callbackParam);
+
+        private const uint MiniDumpWithFullMemory = 0x00000002;
+
+        public static async Task GenerateEvidenceBundleAsync(int targetPid, string targetProcessName, string zipDestinationPath)
+        {
+            await Task.Run(() =>
+            {
+                string tempDir = Path.Combine(Path.GetTempPath(), $"NW_Evidence_{DateTime.Now:yyyyMMdd_HHmmss}");
+                Directory.CreateDirectory(tempDir);
+
+                try
+                {
+                    // 1. Dynamic Port Info
+                    try
+                    {
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = "netsh",
+                            Arguments = "int ipv4 show dynamicport tcp",
+                            RedirectStandardOutput = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using var p = Process.Start(psi);
+                        string output = p?.StandardOutput.ReadToEnd() ?? string.Empty;
+                        p?.WaitForExit();
+                        File.WriteAllText(Path.Combine(tempDir, "01_System_DynamicPortInfo.txt"), output);
+                    }
+                    catch (Exception ex)
+                    {
+                        File.WriteAllText(Path.Combine(tempDir, "01_System_DynamicPortInfo.txt"), $"Error collecting dynamic port info: {ex.Message}");
+                    }
+
+                    // 2. Authoritative CIM Bound Sockets via PowerShell (Zero NuGet dependency)
+                    try
+                    {
+                        string csvPath = Path.Combine(tempDir, "02_LiveSockets_CIM.csv");
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = "powershell.exe",
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        psi.ArgumentList.Add("-NoProfile");
+                        psi.ArgumentList.Add("-ExecutionPolicy");
+                        psi.ArgumentList.Add("Bypass");
+                        psi.ArgumentList.Add("-Command");
+                        psi.ArgumentList.Add($"Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | Export-Csv -Path '{csvPath}' -NoTypeInformation");
+
+                        using var p = Process.Start(psi);
+                        p?.WaitForExit();
+                    }
+                    catch (Exception ex)
+                    {
+                        File.WriteAllText(Path.Combine(tempDir, "02_LiveSockets_CIM.csv"), $"Error querying CIM: {ex.Message}");
+                    }
+
+                    // 3. Active Process Snapshot
+                    try
+                    {
+                        var sb = new StringBuilder();
+                        sb.AppendLine("PID,ProcessName,HandleCount,Threads,WorkingSetMB");
+                        foreach (var proc in Process.GetProcesses())
+                        {
+                            try
+                            {
+                                sb.AppendLine($"{proc.Id},{proc.ProcessName},{proc.HandleCount},{proc.Threads.Count},{proc.WorkingSet64 / (1024 * 1024)}");
+                            }
+                            catch { }
+                            finally { proc.Dispose(); }
+                        }
+                        File.WriteAllText(Path.Combine(tempDir, "03_ActiveProcessSnapshot.csv"), sb.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        File.WriteAllText(Path.Combine(tempDir, "03_ActiveProcessSnapshot.csv"), $"Error generating process snapshot: {ex.Message}");
+                    }
+
+                    // 4. Mitigation Audit Trail
+                    string histPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "NetworkWatchdogService", "MitigationHistory.csv");
+                    if (File.Exists(histPath))
+                    {
+                        try { File.Copy(histPath, Path.Combine(tempDir, "04_MitigationAuditTrail.csv"), true); } catch { }
+                    }
+
+                    // 5. Memory Dump (DbgHelp.dll)
+                    if (targetPid > 4)
+                    {
+                        try
+                        {
+                            using var targetProcess = Process.GetProcessById(targetPid);
+                            string dmpPath = Path.Combine(tempDir, "05_ProcessMemoryDump.dmp");
+                            using var fs = new FileStream(dmpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                            MiniDumpWriteDump(targetProcess.Handle, (uint)targetPid, fs.SafeFileHandle, MiniDumpWithFullMemory, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                        }
+                        catch (Exception ex)
+                        {
+                            File.WriteAllText(Path.Combine(tempDir, "05_ProcessMemoryDump_Error.txt"), $"Error dumping PID {targetPid}: {ex.Message}");
+                        }
+                    }
+
+                    // 6. Watchdog Event Log
+                    try
+                    {
+                        var log = new EventLog("Application");
+                        var sb = new StringBuilder();
+                        foreach (EventLogEntry entry in log.Entries)
+                        {
+                            if (entry.Source.Contains("NetworkWatchdog") || entry.Message.Contains("NetworkWatchdog"))
+                            {
+                                sb.AppendLine($"[{entry.TimeGenerated}] [{entry.EntryType}] {entry.Message}");
+                            }
+                        }
+                        File.WriteAllText(Path.Combine(tempDir, "06_Watchdog_EventLog.txt"), sb.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        File.WriteAllText(Path.Combine(tempDir, "06_Watchdog_EventLog.txt"), $"Error reading event log: {ex.Message}");
+                    }
+
+                    // Compress to Target ZIP
+                    if (File.Exists(zipDestinationPath)) File.Delete(zipDestinationPath);
+                    ZipFile.CreateFromDirectory(tempDir, zipDestinationPath);
+                }
+                finally
+                {
+                    try { Directory.Delete(tempDir, true); } catch { }
+                }
+            });
+        }
+    }
+
     public class DashboardForm : Form
     {
         private readonly Action<int, string> _killAction;
@@ -388,10 +539,13 @@ namespace NetworkWatchdog.TrayApp
         private readonly ListBox _listWhitelist;
         private readonly TrackBar _sliderThreshold;
         private readonly NumericUpDown _numThreshold;
+        private readonly CheckBox _chkAutoTargetTop;
 
         private readonly string _historyCsvPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "NetworkWatchdogService", "MitigationHistory.csv");
+
+        private TelemetryPacket? _latestPacket;
 
         public DashboardForm(Action<int, string> killAction, Func<ConfigUpdateCommand, bool> sendConfigAction)
         {
@@ -399,7 +553,7 @@ namespace NetworkWatchdog.TrayApp
             _sendConfigAction = sendConfigAction;
 
             Text = "NetworkWatchdog Telemetry & Control Dashboard";
-            Size = new Size(800, 540);
+            Size = new Size(820, 560);
             StartPosition = FormStartPosition.CenterScreen;
 
             _tabs = new TabControl { Dock = DockStyle.Fill };
@@ -412,7 +566,7 @@ namespace NetworkWatchdog.TrayApp
             _gridProcesses.Columns.Add("Status", "Status");
 
             var btnPanel = new Panel { Dock = DockStyle.Bottom, Height = 45 };
-            var btnKill = new Button { Text = "Terminate Process Tree", Width = 180, Height = 32, Top = 6, Left = 10 };
+            var btnKill = new Button { Text = "Terminate Process Tree", Width = 170, Height = 32, Top = 6, Left = 10 };
             btnKill.Click += (s, e) =>
             {
                 if (_gridProcesses.SelectedRows.Count > 0)
@@ -423,7 +577,12 @@ namespace NetworkWatchdog.TrayApp
                     if (pid > 0) _killAction(pid, name);
                 }
             };
+
+            var btnEvidence = new Button { Text = "Export Evidence Bundle (.zip)", Width = 210, Height = 32, Top = 6, Left = 190 };
+            btnEvidence.Click += async (s, e) => await ExportEvidenceBundleUserInitiated();
+
             btnPanel.Controls.Add(btnKill);
+            btnPanel.Controls.Add(btnEvidence);
             tabProcesses.Controls.Add(_gridProcesses);
             tabProcesses.Controls.Add(btnPanel);
 
@@ -454,7 +613,6 @@ namespace NetworkWatchdog.TrayApp
             var pnlSettings = new Panel { Dock = DockStyle.Fill, Padding = new Padding(15) };
 
             var lblThresh = new Label { Text = "Global Max TCP/UDP Connections Threshold:", Top = 15, Left = 15, Width = 300 };
-            
             _sliderThreshold = new TrackBar { Top = 40, Left = 15, Width = 300, Minimum = 200, Maximum = 10000, TickFrequency = 250, SmallChange = 50, LargeChange = 250 };
             _numThreshold = new NumericUpDown { Top = 40, Left = 330, Width = 80, Minimum = 200, Maximum = 10000 };
             var btnSaveConfig = new Button { Text = "Save Configuration", Top = 38, Left = 430, Width = 150 };
@@ -480,11 +638,20 @@ namespace NetworkWatchdog.TrayApp
                 }
             };
 
-            var lblWhite = new Label { Text = "Excluded / Whitelisted Processes (Bypass Auto-Kill):", Top = 90, Left = 15, Width = 350 };
-            _listWhitelist = new ListBox { Top = 115, Left = 15, Width = 280, Height = 180 };
+            _chkAutoTargetTop = new CheckBox
+            {
+                Text = "Auto-Target Top Socket Consuming Process for Dumps",
+                Top = 80,
+                Left = 15,
+                Width = 400,
+                Checked = false
+            };
 
-            var txtNewItem = new TextBox { Top = 305, Left = 15, Width = 180 };
-            var btnAdd = new Button { Text = "Add", Top = 303, Left = 205, Width = 90 };
+            var lblWhite = new Label { Text = "Excluded / Whitelisted Processes (Bypass Auto-Kill):", Top = 115, Left = 15, Width = 350 };
+            _listWhitelist = new ListBox { Top = 140, Left = 15, Width = 280, Height = 170 };
+
+            var txtNewItem = new TextBox { Top = 320, Left = 15, Width = 180 };
+            var btnAdd = new Button { Text = "Add", Top = 318, Left = 205, Width = 90 };
             btnAdd.Click += (s, e) =>
             {
                 string proc = txtNewItem.Text.Trim();
@@ -498,7 +665,7 @@ namespace NetworkWatchdog.TrayApp
                 }
             };
 
-            var btnRemove = new Button { Text = "Remove Selected", Top = 335, Left = 15, Width = 150 };
+            var btnRemove = new Button { Text = "Remove Selected", Top = 350, Left = 15, Width = 150 };
             btnRemove.Click += (s, e) =>
             {
                 if (_listWhitelist.SelectedItem != null)
@@ -511,13 +678,78 @@ namespace NetworkWatchdog.TrayApp
                 }
             };
 
-            pnlSettings.Controls.AddRange(new Control[] { lblThresh, _sliderThreshold, _numThreshold, btnSaveConfig, lblWhite, _listWhitelist, txtNewItem, btnAdd, btnRemove });
+            pnlSettings.Controls.AddRange(new Control[] { lblThresh, _sliderThreshold, _numThreshold, btnSaveConfig, _chkAutoTargetTop, lblWhite, _listWhitelist, txtNewItem, btnAdd, btnRemove });
             tabSettings.Controls.Add(pnlSettings);
 
             _tabs.TabPages.AddRange(new[] { tabProcesses, tabRestartsSession, tabRestartsHistorical, tabSettings });
             Controls.Add(_tabs);
 
             LoadHistoricalLog();
+        }
+
+        private async Task ExportEvidenceBundleUserInitiated()
+        {
+            int targetPid = 0;
+            string targetName = "Unknown";
+
+            if (_chkAutoTargetTop.Checked && _latestPacket != null && _latestPacket.Processes.Count > 0)
+            {
+                var top = _latestPacket.Processes.OrderByDescending(p => p.Connections).First();
+                targetPid = top.Pid;
+                targetName = top.ServiceName;
+            }
+            else if (_gridProcesses.SelectedRows.Count > 0)
+            {
+                var row = _gridProcesses.SelectedRows[0];
+                targetName = row.Cells["ServiceName"].Value?.ToString() ?? "Target";
+                targetPid = int.TryParse(row.Cells["Pid"].Value?.ToString(), out int p) ? p : 0;
+            }
+
+            if (targetPid <= 4 && !_chkAutoTargetTop.Checked)
+            {
+                MessageBox.Show("Please select an active process from the grid, or check 'Auto-Target Top Socket Consuming Process for Dumps' in Settings.", "No Process Selected", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using var sfd = new SaveFileDialog
+            {
+                Filter = "ZIP Archive (*.zip)|*.zip",
+                FileName = $"NetworkWatchdog_Evidence_{targetName}_{DateTime.Now:yyyyMMdd_HHmmss}.zip",
+                Title = "Save Diagnostic Evidence Bundle As"
+            };
+
+            if (sfd.ShowDialog() == DialogResult.OK)
+            {
+                Cursor = Cursors.WaitCursor;
+                try
+                {
+                    await EvidenceCollector.GenerateEvidenceBundleAsync(targetPid, targetName, sfd.FileName);
+                    MessageBox.Show($"Evidence bundle created successfully:\n{sfd.FileName}", "Evidence Collected", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Failed to generate evidence bundle:\n{ex.Message}", "Collection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                finally
+                {
+                    Cursor = Cursors.Default;
+                }
+            }
+        }
+
+        public async Task AutoCollectTopProcessDumpAsync()
+        {
+            if (!_chkAutoTargetTop.Checked || _latestPacket == null || _latestPacket.Processes.Count == 0) return;
+
+            var top = _latestPacket.Processes.OrderByDescending(p => p.Connections).First();
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            string zipPath = Path.Combine(appDir, $"AutoEvidence_{top.ServiceName}_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+
+            try
+            {
+                await EvidenceCollector.GenerateEvidenceBundleAsync(top.Pid, top.ServiceName, zipPath);
+            }
+            catch { }
         }
 
         private void LoadHistoricalLog()
@@ -550,6 +782,8 @@ namespace NetworkWatchdog.TrayApp
 
         public void RefreshData(TelemetryPacket packet)
         {
+            _latestPacket = packet;
+
             int procScroll = _gridProcesses.FirstDisplayedScrollingRowIndex;
             var procSelected = _gridProcesses.SelectedRows.Count > 0 ? _gridProcesses.SelectedRows[0].Cells["Pid"].Value?.ToString() : null;
 

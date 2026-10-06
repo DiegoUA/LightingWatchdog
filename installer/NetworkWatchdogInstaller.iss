@@ -1,6 +1,6 @@
 [Setup]
 AppName=Network Watchdog Service
-AppVersion=3.7.1
+AppVersion=3.8.0
 AppPublisher=Network Watchdog
 DefaultDirName={autopf}\NetworkWatchdog
 ArchitecturesInstallIn64BitMode=x64
@@ -36,7 +36,6 @@ end;
 [Run]
 Filename: "{sys}\sc.exe"; Parameters: "create NetworkWatchdogService binPath= ""{app}\NetworkWatchdogService.exe"" start= auto"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "start NetworkWatchdogService"; Flags: runhidden
-; Removed 'skipifsilent' and added 'runasoriginaluser' so the OTA updater launches the dashboard in the active user session
 Filename: "{app}\NetworkWatchdog.TrayApp.exe"; Description: "Launch NetworkWatchdog Dashboard"; Flags: nowait postinstall runasoriginaluser
 
 [UninstallRun]

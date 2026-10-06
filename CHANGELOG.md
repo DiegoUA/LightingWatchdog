@@ -4,6 +4,14 @@ All notable changes to LightingWatchdog are documented here.
 
 ---
 
+## [3.8.0] - 2026-10-06
+
+### Added
+
+- **R&D Diagnostic Evidence Suite**: Added a comprehensive forensic export engine that packages system port limits, CIM socket tables, active process metrics, historical restart audit logs, event logs, and memory dumps into a single `.zip` file for vendor ticket submissions.
+- **Native Memory Minidumps**: Integrated `DbgHelp.dll` (`MiniDumpWriteDump`) directly into the TrayApp to capture unmanaged memory dumps (`.dmp`) of leaking processes on demand.
+- **Dual Diagnostic Targeting Modes**: Users can manually select any active PID and invoke a "Save As" dialog, or check "Auto-Target Top Socket Consuming Process for Dumps" to save bundles directly to the application directory.
+
 ## [3.7.2] - 2026-10-06
 
 ### Added

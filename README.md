@@ -108,6 +108,7 @@ While originally built to tame `LightingService.exe`, it has evolved into a syst
 | **v3.7.0** | 2026-10-06 | **Configuration Automation:** Fully wired `appsettings.json`, added native Windows Restart Manager interop for file-lock dependency termination, and introduced Quarantine/Cooldown lifecycles with Syslog forwarding. |
 | **v3.7.1** | 2026-10-06 | **UI & Updater Stabilization:** Fixed auto-updater silent respawning context and resolved UI grid scrolling, WinForms thread-safety, and context menu refresh glitches. |
 | **v3.7.2** | 2026-10-06 | **Updater SemVer & Log Persistence:** Fixed self-updater infinite loop via dynamic assembly version resolution and introduced persistent Historical Mitigation logging. |
+| **v3.8.0** | 2026-10-06 | **R&D Diagnostic Evidence Suite:** Implemented one-click and automated evidence bundle generation (.zip) containing system port baselines, CIM socket dumps, process table telemetry, historical audit trails, event logs, and native memory minidumps via `DbgHelp.dll`. |
 
 *(For full patch details, view `CHANGELOG.md`)*
 
