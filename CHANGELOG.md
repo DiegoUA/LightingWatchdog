@@ -1,8 +1,35 @@
 # Changelog
 
-All notable changes to the LightingWatchdog PowerShell toolkit are documented here (v1.0.0 to v2.7.3). The project continued as the C# application NetworkWatchdog (v3.0.0 onward), whose history is documented at https://github.com/DiegoUA/NetworkWatchdog .
+All notable changes to the LightingWatchdog PowerShell toolkit are documented here (v1.0.0 onward, current v2.7.4). The C# application NetworkWatchdog (v3.0.0 onward) grew out of this project and is developed in parallel; its history is documented at https://github.com/DiegoUA/NetworkWatchdog .
 
 ---
+
+## [2.7.4] - 2026-10-31
+
+### Added
+
+- `Start-LightingWatchdog.bat`: one-click launcher with a menu (monitor only, monitor and manage, single scan). Mode `manage` asks Windows for administrator rights; `monitor` and `scan` run without them. The modes can also be passed on the command line (`monitor`, `manage`, `scan`), e.g. for Task Scheduler.
+- `-MonitorOnly` switch for `NetworkDiag.ps1 -Watchdog`: detects, reports and logs a leak (once per episode) without stopping, killing or restarting anything, and skips auto-kill.
+- Elevation warning when the full watchdog starts without administrator rights (`Test-IsAdministrator` in `Utils.psm1`).
+- A one-line reminder at watchdog start that clicking inside the console pauses it (QuickEdit).
+- `.gitattributes` keeping Windows line endings for `.bat` files.
+
+### Fixed
+
+- A restart whose kill step failed (typically missing administrator rights) was still reported as a successful restart. It now prints and logs `RESTART FAILED`, does not start the service, writes no `RestartEvents_v2.csv` row, sends no webhook and does not count towards quarantine. The same applies when the service is not `Running` after the start attempt (checked for up to 10 seconds).
+- Failed restart attempts are now throttled by the cooldown (`LastRestartAttempt`), so the watchdog no longer retries on every scan.
+- `Invoke-AutoKill` assumed one instance per process name; with several instances (such as `ArmouryWebBrowserEdge`) the memory comparison failed and nothing was killed. Every instance is now judged separately, `Name.exe` is accepted, the watchdog's own process, protected system names and wildcard entries are skipped, termination is verified and reported (`AUTO-KILL OK` / `AUTO-KILL FAILED`) on the console and in the log, an unkillable process is reported once, and a missing or invalid `AutoKillMemThresholdMB` disables auto-kill with a one-time warning.
+- With `EnableJsonExport` set to `false` the watchdog never detected a leak, and it could act on a stale `diag_*.json`. It now uses the result of the current scan from memory, so the export switches only control which files are written.
+- Watchdog actions were written to `watchdog_fallback.log` because the scan log is a `.txt` file and the lookup only accepted `.log`. They are now appended to the scan's own log.
+- `NetworkDiag.ps1` now stops with a clear message when `config.json` is missing or invalid.
+
+### Removed
+
+- Configuration keys that no code ever read: `EnablePopups` (popups were removed in 2.6.1; `Show-Alert` lost its popup parameter), `MaxLogFiles`, `AutoKillCpuThreshold` and `QuarantineDurationMinutes`. A `config.json` that still contains them keeps working; the keys are ignored.
+
+### Documentation
+
+- README: a section explaining the Windows "publisher could not be verified" prompt (why it appears, why the launcher is safe, how to avoid it), new launcher and monitor-only sections, the "known limitation" about failed kills removed (fixed), a Known Limitations section (non-paged pool metric always 0 %, logs not rotated), updated configuration notes and output description.
 
 ## [2.7.3] - 2026-09-06
 

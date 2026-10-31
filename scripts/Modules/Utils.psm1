@@ -63,7 +63,6 @@ function Show-Alert {
     param(
         [string]$Message,
         [string]$Title = "Watchdog Alert",
-        [bool]$EnablePopups = $false, # Kept for backward compatibility, completely ignored
         [string]$LogFile = $null
     )
 
@@ -73,6 +72,17 @@ function Show-Alert {
     # 2. Write to the log file if a path is provided
     if (![string]::IsNullOrWhiteSpace($LogFile)) {
         Write-Log -File $LogFile -Message "[$Title] $Message"
+    }
+}
+
+function Test-IsAdministrator {
+    # True when the current PowerShell session runs elevated (Run as administrator).
+    try {
+        $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
     }
 }
 
@@ -95,4 +105,4 @@ function Send-WebhookNotification {
     }
 }
 
-Export-ModuleMember -Function Get-Config, Get-Timestamp, Send-WebhookNotification, Show-Alert, Write-Log
+Export-ModuleMember -Function Get-Config, Get-Timestamp, Send-WebhookNotification, Show-Alert, Test-IsAdministrator, Write-Log

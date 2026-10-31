@@ -3,9 +3,7 @@
     "NonPagedPoolThreshold": 70,
     "StormThreshold": 200,
     "WatchdogIntervalSeconds": 60,
-    "MaxLogFiles": 20,
 
-    "EnablePopups": true,
     "EnableJsonExport": true,
     "EnableCsvExport": true,
     "TrendWindow": 20,
@@ -23,11 +21,9 @@
     "EnableQuarantine": true,
     "QuarantineRestartLimit": 3,
     "QuarantineWindowMinutes": 10,
-    "QuarantineDurationMinutes": 30,
 
     "EnableAutoKill": true,
     "AutoKillProcesses": [ "ArmouryWebBrowserEdge", "GameVisual" ],
-    "AutoKillCpuThreshold": 80,
     "AutoKillMemThresholdMB": 500,
 
     "Weights": {

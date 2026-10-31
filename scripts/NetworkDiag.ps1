@@ -1,4 +1,4 @@
-param([switch]$Watchdog)
+param([switch]$Watchdog, [switch]$MonitorOnly)
 
 # --- Resolve absolute script directory ---
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -24,8 +24,17 @@ Get-Command Get-Config, Invoke-Diagnostics, Start-Watchdog | Format-Table Name, 
 # --- Main execution ---
 $Config = Get-Config
 
+if ($null -eq $Config) {
+    Write-Host "ERROR: config\config.json is missing or is not valid JSON. See logs\application.log. Nothing was started." -ForegroundColor Red
+    exit 1
+}
+
+if ($MonitorOnly -and -not $Watchdog) {
+    Write-Host "NOTE: -MonitorOnly only applies together with -Watchdog. Running a single diagnostic scan." -ForegroundColor Yellow
+}
+
 if ($Watchdog) {
-    Start-Watchdog -Config $Config
+    Start-Watchdog -Config $Config -MonitorOnly:$MonitorOnly
 } else {
     Invoke-Diagnostics -Config $Config
 }

@@ -108,7 +108,7 @@ function Invoke-Diagnostics {
         
         if ($isLeaking) {
             Write-Log -File $logFile -Message "LEAK DETECTED in $($target.ServiceName)"
-            Show-Alert "$($target.ServiceName) leak detected ($connCount conns)" "Watchdog" $Config.EnablePopups
+            Show-Alert "$($target.ServiceName) leak detected ($connCount conns)" "Watchdog"
         }
 
         $serviceStates += @{
@@ -139,7 +139,7 @@ function Invoke-Diagnostics {
 
     if ($npPct -gt $Config.NonPagedPoolThreshold) {
         $result.NonPagedPressure = $true
-        Show-Alert "Nonpaged pool high ($npPct%)" "Kernel Alert" $Config.EnablePopups
+        Show-Alert "Nonpaged pool high ($npPct%)" "Kernel Alert"
         Write-Log -File $logFile -Message "KERNEL PRESSURE DETECTED"
     }
 
@@ -162,7 +162,7 @@ function Invoke-Diagnostics {
         $result.UdpNewPerSec -gt $Config.StormThreshold) {
 
         $result.StormDetected = $true
-        Show-Alert "WebSocket storm detected" "Storm Alert" $Config.EnablePopups
+        Show-Alert "WebSocket storm detected" "Storm Alert"
         Write-Log -File $logFile -Message "STORM DETECTED"
     }
 
@@ -208,7 +208,7 @@ function Invoke-Diagnostics {
     if ($Config.EnablePredictiveAlerts) {
         if ([math]::Abs($trend.ZScore) -ge 2) {
             Write-Log -File $logFile -Message "ANOMALY: Health score deviates significantly (Z=$($trend.ZScore))."
-            Show-Alert "Health anomaly detected (Z=$($trend.ZScore)). Trend: $($trend.TrendDirection)." "LightingWatchdog Trend" $Config.EnablePopups
+            Show-Alert "Health anomaly detected (Z=$($trend.ZScore)). Trend: $($trend.TrendDirection)." "LightingWatchdog Trend"
         }
 
         if ($result.LeakGrowthRate -gt 10) {
@@ -261,6 +261,9 @@ function Invoke-Diagnostics {
     } else {
         $trendRow | Export-Csv -Path $trendCsvPath -NoTypeInformation -Append
     }
+
+    # Hand this cycle's result to the watchdog in memory, so it no longer depends on EnableJsonExport
+    $global:LastDiagnosticsResult = $result
 
     return $logFile
 }
