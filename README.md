@@ -9,7 +9,7 @@ PowerShell diagnostic and watchdog toolkit for the ASUS `LightingService` socket
 ## 🧬 Lineage
 
 * **v1.x and v2.x** (this repository): the PowerShell toolkit. It stays on the 2.x line and is developed independently of the C# application.
-* **v3.0.0 onward**: the C# application, developed and released in [DiegoUA/NetworkWatchdog](https://github.com/DiegoUA/NetworkWatchdog). Its version numbers continued from this project (they were not restarted) so that installed copies of the application could compare versions when they check for updates.
+* **The C# application** is developed and released in [DiegoUA/NetworkWatchdog](https://github.com/DiegoUA/NetworkWatchdog) with its own version numbers (1.x; early builds were numbered 3.x and were briefly published here as v3.0.0 to v3.9.0, removed on 2026-11-02). It does not share a version line with this toolkit.
 * The current PowerShell version is **v2.7.4**. The history of the C# application is documented in the NetworkWatchdog repository.
 
 ---

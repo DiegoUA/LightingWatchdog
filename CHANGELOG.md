@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the LightingWatchdog PowerShell toolkit are documented here (v1.0.0 onward, current v2.7.4). The C# application NetworkWatchdog (v3.0.0 onward) grew out of this project and is developed in parallel; its history is documented at https://github.com/DiegoUA/NetworkWatchdog .
+All notable changes to the LightingWatchdog PowerShell toolkit are documented here (v1.0.0 onward, current v2.7.4). The C# application NetworkWatchdog grew out of this project but is a separate project with its own releases and its own version numbers (1.x); its history is documented at https://github.com/DiegoUA/NetworkWatchdog . Early builds of that application were briefly published in this repository as v3.0.0 to v3.9.0; those releases were removed on 2026-11-02 and are not part of this project.
 
 ---
 
